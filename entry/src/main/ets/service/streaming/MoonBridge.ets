@@ -116,6 +116,8 @@ export const LI_CCAP_ACCEL = 0x10;
 export const LI_CCAP_GYRO = 0x20;
 export const LI_CCAP_BATTERY_STATE = 0x40;
 export const LI_CCAP_RGB_LED = 0x80;
+/** 客户端可渲染主机原始 DualSense 立体声 PCM 触觉波形 */
+export const LI_CCAP_DS5_HAPTICS_PCM = 0x200;
 
 // 与 moonlight-common-c Limelight.h 的 LI_BATTERY_STATE_* 保持一致
 export const LI_BATTERY_STATE_UNKNOWN = 0x00;
@@ -203,6 +205,27 @@ export interface Ds5HapticsIrLaneV2 {
   transientStrength: number;
   lowBandRatio: number;
   zeroCrossingRateHz: number;
+}
+
+/**
+ * 主机原始 DualSense 触觉波形（48kHz/2ch/16bit）在 native 层聚合成 20ms 帧后的
+ * 波形描述。这些值直接由 PCM 样本测得，不是主机压缩过的统计特征。
+ * leftRms/rightRms 是真实包络（0-1），决定「该强的强、该弱的弱」。
+ */
+export interface Ds5HapticsPcmFrame {
+  flags: number;
+  controllerNumber: number;
+  frameCount: number;
+  silent: number;
+  presentationTimeUs: number;
+  leftRms: number;
+  rightRms: number;
+  leftLowRatio: number;
+  rightLowRatio: number;
+  attack: number;
+  texture: number;
+  /** v20: 4 子带频谱权重（0..1，按能量归一化），驱动协议 4 谐波分量 */
+  bandAmp?: number[];
 }
 
 /** Device-independent authored DualSense haptics frame (IR protocol v2). */
@@ -318,6 +341,10 @@ export interface ConnectionListenerCallbacks {
   rumble?: (controllerNumber: number, lowFreqMotor: number, highFreqMotor: number) => void;
   /** Device-independent DualSense IR v2 authored haptics. */
   ds5HapticsIrV2?: (frame: Ds5HapticsIrV2Frame) => void;
+  /** 主机原始 DualSense 触觉波形帧（优先于 IR v2）。 */
+  ds5HapticsPcm?: (frame: Ds5HapticsPcmFrame) => void;
+  /** v23: native 重采样打包的 PeaSyo 同款 64B raw 触感帧（48k→4k），直发雷蛇 Interface 3。 */
+  razerRawHaptic?: (frames: Uint8Array) => void;
   /** Raw DualSense adaptive trigger state. */
   setAdaptiveTriggers?: (frame: AdaptiveTriggersFrame) => void;
   /** 连接状态更新 */

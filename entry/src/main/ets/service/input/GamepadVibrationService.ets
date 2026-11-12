@@ -23,9 +23,12 @@ import { UsbDriverService, AbstractController } from '../usbdriver/index';
 import { AudioHapticFrameFlag } from '../AudioHapticFrame';
 import { RUMBLE_MAX } from './GamepadTypes';
 import { DeviceVibrationCoordinator } from './DeviceVibrationCoordinator';
+import { RazerKishiHaptics } from '../usbdriver/RazerKishiHaptics';
+import { RazerKishiRawHaptics } from '../usbdriver/RazerKishiRawHaptics';
 import {
   Ds5HapticsIrV2Frame,
   Ds5HapticsIrLaneV2,
+  Ds5HapticsPcmFrame,
   AdaptiveTriggersFrame,
   DS_EFFECT_RIGHT_TRIGGER,
   DS_EFFECT_LEFT_TRIGGER,
@@ -37,6 +40,7 @@ import {
   normalizeGameVibrationStrength
 } from '../../model/StreamConfig';
 import { Logger } from '../../common/Logger';
+import { ExternalGamepadVibrator } from '../externalvibrator/ExternalGamepadVibrator';
 
 interface MotorPair {
   low: number;
@@ -69,9 +73,12 @@ export class GamepadVibrationService {
   // The host's SILENT flag currently represents digital silence. Apply a
   // client-side gate so authored-channel noise does not become a persistent
   // low rumble. Separate thresholds avoid chattering around the boundary.
-  private static readonly IR_GATE_OPEN_AMPLITUDE = 0.008;
-  private static readonly IR_GATE_CLOSE_AMPLITUDE = 0.004;
-  private static readonly IR_GATE_CLOSE_FRAMES = 4;
+  // v14 把门限抬到 0.020，直接挡掉了剑星下雨这类细密弱触觉帧。
+  // 参考 PeaSyo 连续转发 PS5 音频触觉流的做法：门限只用来切掉真正的静音，
+  // 不用来过滤弱效果；底噪由驱动层的「0 输入绝对静音 + 短 hold」控制。
+  private static readonly IR_GATE_OPEN_AMPLITUDE = 0.010;
+  private static readonly IR_GATE_CLOSE_AMPLITUDE = 0.005;
+  private static readonly IR_GATE_CLOSE_FRAMES = 3;
   private static readonly IR_OUTPUT_FLOOR = 0.004;
   /** Generic USB rumble actuators do not need the authored stream's 200 Hz update rate. */
   private static readonly IR_USB_RENDER_INTERVAL_MS = 10;
@@ -93,10 +100,18 @@ export class GamepadVibrationService {
   private static readonly IR_FLAG_DISCONTINUITY = 0x01;
   private static readonly IR_FLAG_STREAM_END = 0x04;
   private static readonly IR_FLAG_SILENT = 0x08;
-  /** IR authored output takes the game slot while active; ordinary state resumes afterwards. */
-  private static readonly IR_PRIORITY_OVER_GAME = true;
+  /**
+   * IR 与游戏 rumble 合并而不是覆盖。
+   * Sunshine 开启 ds5_audio_haptics 后，200Hz 的 IR 分析流会几乎一直存在；
+   * 旧策略让低幅值的 IR 帧覆盖游戏发出的满幅 rumble，结果触感只剩 8/63 左右，
+   * 主观上「震感远不如 DS5」。改为有界叠加后，满幅 rumble 保留，IR 提供细节。
+   */
+  private static readonly IR_PRIORITY_OVER_GAME = false;
+  /** 触感默认增益（%），与用户的「游戏震动强度」滑块等比联动 */
+  private static readonly RAZER_HAPTICS_BASE_BOOST = 150;
   private usbDriverService: UsbDriverService;
   private deviceVibrationCoordinator: DeviceVibrationCoordinator;
+  private externalGamepadVibrator: ExternalGamepadVibrator;
   
   // 设置
   private vibrationFeedbackEnabled = true;
@@ -114,6 +129,12 @@ export class GamepadVibrationService {
   // USB 振动 watchdog: 防止 USB 传输失败导致振动卡死
   private rumbleWatchdogTimer: number = -1;
   private lastRumbleControllerNumber: number = 0;
+  /** 混合输出诊断日志节流（1s），用于确认 IR 是否压住了游戏 rumble */
+  private lastMixLogMs: number = 0;
+  /** 最近一帧主机原始触觉波形到达时间，用于判断 PCM 流是否活跃 */
+  private lastPcmFrameMs: number = 0;
+  /** PCM 流活跃判定窗口（毫秒） */
+  private static readonly PCM_ACTIVE_MS = 400;
   private static readonly RUMBLE_WATCHDOG_MS = 3000;
   // USB 停止确认: 延迟重发 stop(0,0) 防止 USB 传输丢失
   private stopConfirmTimer: number = -1;
@@ -148,6 +169,7 @@ export class GamepadVibrationService {
     this.usbDriverService = usbDriverService;
     this.deviceKeyToSlotLookup = deviceKeyToSlot;
     this.deviceVibrationCoordinator = DeviceVibrationCoordinator.getInstance();
+    this.externalGamepadVibrator = ExternalGamepadVibrator.instance;
     this.deviceVibrationCoordinator.setSourceResumeCallback((): void => {
       // A touch haptic stopped the body motor; the steady effect must restart.
       this.invalidateSteadyDeviceEffect();
@@ -175,7 +197,15 @@ export class GamepadVibrationService {
     }
     if (!enabled || this.gameVibrationStrength <= 0) {
       this.stopIrSource();
+      this.externalGamepadVibrator.stopAll();
     }
+    // 用户已有一个「游戏震动强度」滑块（0-200）。把它等比映射到雷蛇触感增益，
+    // 拉到 150/200 时中等幅度的 rumble 也能接近满幅触感，无需新增 UI。
+    RazerKishiHaptics.getInstance().setBoost(Math.round(
+      GamepadVibrationService.RAZER_HAPTICS_BASE_BOOST *
+      this.gameVibrationStrength / GAME_VIBRATION_STRENGTH_ORIGINAL));
+    // v23: raw-PCM 直灌路径按同一滑块等比缩放振幅（100=原始波形，200=2 倍）
+    RazerKishiRawHaptics.getInstance().setStrength(this.gameVibrationStrength);
     this.rerenderAllSources();
   }
 
@@ -216,6 +246,7 @@ export class GamepadVibrationService {
     this.submitGameUsbRumble(
       controllers, controllerNumber, lowFreqMotor, highFreqMotor);
     this.submitGameDeviceRumble(lowFreqMotor, highFreqMotor);
+    this.submitGameExternalRumble(controllerNumber, lowFreqMotor, highFreqMotor);
 
     // USB 停止确认: 100ms 后重发 stop(0,0)，防止首次 USB 传输被覆盖或丢失
     if (lowFreqMotor === 0 && highFreqMotor === 0 && hasUsbController &&
@@ -231,6 +262,26 @@ export class GamepadVibrationService {
    * SILENT/STREAM_END 只会清理 IR 来源，普通游戏振动和音频来源仍由
    * mixer 持有并继续输出。
    */
+  /**
+   * 主机原始 DualSense 触觉波形（48kHz 立体声 PCM 在 native 层聚合为 20ms 帧）。
+   *
+   * 与 IR v2 不同，这里不做噪声门、不做幅度压缩、不猜测事件时长：PCM 帧里的
+   * 包络、频段占比、过零率和瞬态都直接来自游戏写给虚拟手柄音频端点的波形。
+   * 只要这个流在，就由它接管雷蛇触感接口；主机停发后 mixer 自动回落到
+   * rumble / IR 路径，因此老版本 Sunshine 的行为完全不受影响。
+   */
+  handleDs5HapticsPcm(frame: Ds5HapticsPcmFrame): void {
+    if (!this.vibrationFeedbackEnabled || this.gameVibrationStrength <= 0) {
+      return;
+    }
+    // 静音帧只负责立即收尾，不刷新活跃时间戳：否则主机持续发静音帧时
+    // 会把 rumble 兜底一直压住，游戏同时下发的普通震动就彻底丢失。
+    if (frame.silent === 0) {
+      this.lastPcmFrameMs = Date.now();
+    }
+    RazerKishiHaptics.getInstance().renderPcmFrame(frame);
+  }
+
   handleDs5HapticsIrV2(frame: Ds5HapticsIrV2Frame): void {
     if (!this.vibrationFeedbackEnabled || this.gameVibrationStrength <= 0) {
       return;
@@ -426,6 +477,7 @@ export class GamepadVibrationService {
     this.gameUsbRumble.clear();
     this.irUsbRumble.clear();
     this.audioUsbRumble.clear();
+    this.lastPcmFrameMs = 0;
     this.gameDeviceLow = 0;
     this.gameDeviceHigh = 0;
     this.gameDeviceControllerNumber = 0;
@@ -438,6 +490,7 @@ export class GamepadVibrationService {
     this.lastHighFreq = 0;
 
     this.deviceVibrationCoordinator.stopAll();
+    this.externalGamepadVibrator.stopAll();
     this.invalidateSteadyDeviceEffect();
     this.isVibrating = false;
 
@@ -448,6 +501,7 @@ export class GamepadVibrationService {
         this.clearAllTriggerEffects(controller);
         controller.rumble(0, 0);
       }
+      RazerKishiHaptics.getInstance().forceStop();
       if (controllers.length > 0) {
         this.scheduleUsbStopConfirm(this.lastRumbleControllerNumber);
       }
@@ -751,14 +805,30 @@ export class GamepadVibrationService {
       gameLow = this.mixWithHeadroom(scaledGameLow, scaledIrLow, RUMBLE_MAX);
       gameHigh = this.mixWithHeadroom(scaledGameHigh, scaledIrHigh, RUMBLE_MAX);
     }
-    // Authored Channel 3/4 haptics already describe the intended effect.
-    // Mixing the legacy main-audio analyser while IR is active duplicates
-    // energy and commonly produces an unexplained continuous background buzz.
-    const effectiveAudio = irActive ? emptyPair : audio;
-    controller.rumble(
-      this.mixWithHeadroom(gameLow, effectiveAudio.low, RUMBLE_MAX),
-      this.mixWithHeadroom(gameHigh, effectiveAudio.high, RUMBLE_MAX)
-    );
+    // v14 在 IR 激活时把本地音频触觉完全丢弃，导致用户即便打开「音频振动」
+    // 也拿不到雨声/环境音的细节。参考 PeaSyo 的连续触觉流：IR 描述主结构，
+    // 本地音频分析以 35% 权重补充细密颗粒，有界叠加不会重复满幅能量。
+    const effectiveAudio: MotorPair = irActive
+      ? { low: Math.round(audio.low * 0.7), high: Math.round(audio.high * 0.7) }
+      : audio;
+    const finalLow = this.mixWithHeadroom(gameLow, effectiveAudio.low, RUMBLE_MAX);
+    const finalHigh = this.mixWithHeadroom(gameHigh, effectiveAudio.high, RUMBLE_MAX);
+    const nowMs = Date.now();
+    if (nowMs - this.lastMixLogMs >= 1000) {
+      this.lastMixLogMs = nowMs;
+      Logger.info('GamepadVibrationService',
+        `[Vibration] mix game=${scaledGameLow}/${scaledGameHigh} ` +
+        `ir=${scaledIrLow}/${scaledIrHigh} audio=${audio.low}/${audio.high} ` +
+        `=> ${finalLow}/${finalHigh}`);
+    }
+    controller.rumble(finalLow, finalHigh);
+    // 雷蛇骑仕（Sensa HD）触感接口与标准 rumble 通道并行输出；
+    // 设备未挂载时内部为空操作。当主机在发原始触觉波形时，让波形帧独占
+    // 触感接口，避免 0-65535 的压缩 rumble 覆盖真实包络。
+    const razer = RazerKishiHaptics.getInstance();
+    if (Date.now() - this.lastPcmFrameMs > GamepadVibrationService.PCM_ACTIVE_MS) {
+      razer.render(finalLow, finalHigh);
+    }
   }
 
   private applyGameVibrationStrength(value: number): number {
@@ -792,6 +862,7 @@ export class GamepadVibrationService {
     }
     this.clearAllTriggerEffects(controller);
     controller.rumble(0, 0);
+    RazerKishiHaptics.getInstance().forceStop();
     this.usbOutputClearedDeviceKeys.add(deviceKey);
   }
 
@@ -829,6 +900,24 @@ export class GamepadVibrationService {
       case '仅手柄':
       case '协同':
         return true;
+      case '自动':
+      default:
+        return true;
+    }
+  }
+
+  /**
+   * 外接手柄（蓝牙/动态马达）的震动出口策略。
+   * 与 shouldRenderUsbOutput 的区别：不依赖「是否存在 USB 控制器」——
+   * 蓝牙手柄本来就没有 USB 控制器，若按 USB 策略门控会被一律关掉。
+   * 仅在用户选择「仅设备」模式时关闭（此时只震机身、不震手柄）。
+   */
+  private shouldRenderGamepadOutput(): boolean {
+    switch (this.vibrationMode) {
+      case '仅设备':
+        return false;
+      case '仅手柄':
+      case '协同':
       case '自动':
       default:
         return true;
@@ -894,12 +983,12 @@ export class GamepadVibrationService {
       this.stopConfirmTimer = -1;
       const controllers = this.usbDriverService.getControllers();
       this.renderMixedUsb(controllers, controllerNumber);
-    }, 100);
+    }, 25);  // 收得干净：原 100ms 会让每次震完都拖一截尾音
   }
 
   private getIrActivity(frame: Ds5HapticsIrV2Frame): number {
     let activity = 0;
-    for (let index = 0; index < Math.min(2, frame.lanes.length); index++) {
+    for (let index = 0; index < Math.min(4, frame.lanes.length); index++) {
       const lane = frame.lanes[index];
       activity = Math.max(
         activity,
@@ -941,30 +1030,52 @@ export class GamepadVibrationService {
     const normalized = Math.max(0, Math.min(1,
       (value - GamepadVibrationService.IR_OUTPUT_FLOOR) /
       (1 - GamepadVibrationService.IR_OUTPUT_FLOOR)));
-    // A mild perceptual curve retains authored detail without sqrt() turning
-    // sub-percent noise into a clearly perceptible motor command.
-    return Math.pow(normalized, 0.8);
+    // 抬升弱触感：雨声/脚步这类低幅值 IR 帧经过线性映射会被量化抹平。
+    return Math.pow(normalized, 0.65);
   }
 
-  /** 将两条 IR 分析 lane 按客户端校准折叠为标准双马达幅度。 */
+  /**
+   * 把 DS5 四通道触觉分析帧接到雷蛇 Sensa HD：
+   * 既折叠出标准双马达幅度（供普通 USB rumble / 手机马达），也把频谱、
+   * 瞬态、颗粒度、持续/瞬态类型完整下发给波形合成器，不再只压成两个标量。
+   */
   private renderIrFrame(frame: Ds5HapticsIrV2Frame): MotorPair {
-    if (frame.lanes.length < 2) {
+    const laneCount = Math.min(4, frame.lanes.length);
+    if (laneCount === 0) {
       return { low: 0, high: 0 };
     }
 
     let low = 0;
     let high = 0;
-    for (let index = 0; index < 2; index++) {
+    let tone = 0;
+    let attack = 0;
+    let texture = 0;
+    let rmsSum = 0;
+    let crestMax = 0;
+    for (let index = 0; index < laneCount; index++) {
       const lane: Ds5HapticsIrLaneV2 = frame.lanes[index];
       const rms = this.clampUnit(lane.rmsAmplitude);
       const lowBand = this.clampUnit(lane.lowBandRatio);
       const transient = this.clampUnit(lane.transientStrength);
-      low += rms * (0.35 + 0.65 * lowBand);
-      high += rms * (1.0 - lowBand) * 0.65 + transient * 0.35;
+      const zcr = this.clampUnit(lane.zeroCrossingRateHz / 3000);
+      const peak = this.clampUnit(lane.peakAmplitude);
+      low += rms * (0.35 + 0.65 * lowBand) / laneCount;
+      high += (rms * (1.0 - lowBand) * 0.65 + transient * 0.35) / laneCount;
+      tone = Math.max(tone, zcr);
+      attack = Math.max(attack, transient, peak * 0.6);
+      // 过零率高（高频成分）+ 瞬态强 => 冰块/玻璃/沙砾那类颗粒质感
+      texture = Math.max(texture, zcr * 0.7 + transient * 0.3);
+      rmsSum += rms;
+      crestMax = Math.max(crestMax, peak / (rms + 0.05));
     }
+    // 波形平稳、RMS 明显、瞬态弱 => 持续型（引擎、冰块摩擦、环境音），
+    // 保持满幅高幅度；否则按瞬态处理，短促收尾。
+    const sustained = attack < 0.30 &&
+      rmsSum / laneCount > 0.04 && crestMax < 4.0;
+    RazerKishiHaptics.getInstance().setTimbre(tone, attack, texture, sustained);
 
-    low = this.shapeIrAmplitude(Math.max(0, Math.min(1, low * 0.5)));
-    high = this.shapeIrAmplitude(Math.max(0, Math.min(1, high * 0.5)));
+    low = this.shapeIrAmplitude(Math.max(0, Math.min(1, low * 0.80)));
+    high = this.shapeIrAmplitude(Math.max(0, Math.min(1, high * 0.80)));
     return {
       low: this.clampRumbleValue(low * RUMBLE_MAX),
       high: this.clampRumbleValue(high * RUMBLE_MAX)
@@ -1015,6 +1126,25 @@ export class GamepadVibrationService {
     this.gameDeviceHigh = highFreqMotor;
     this.gameDeviceControllerNumber = this.lastRumbleControllerNumber;
     this.renderMixedDevice(false);
+  }
+
+  /**
+   * 外接手柄震动（动态马达 / Dynamic Vibrator）：把震动写到经系统登记为「非本地」振动器的
+   * 蓝牙手柄。无外接手柄时为空操作，不影响现有 USB / 机身马达行为。
+   */
+  private submitGameExternalRumble(controllerNumber: number, lowFreqMotor: number, highFreqMotor: number): void {
+    if (!this.shouldRenderGamepadOutput()) {
+      this.externalGamepadVibrator.stopAll();
+      return;
+    }
+    if (lowFreqMotor === 0 && highFreqMotor === 0) {
+      this.externalGamepadVibrator.stopAll();
+      return;
+    }
+    this.externalGamepadVibrator.rumbleAll(
+      this.applyGameVibrationStrength(lowFreqMotor),
+      this.applyGameVibrationStrength(highFreqMotor)
+    );
   }
 
   private renderMixedDevice(hasAudioTransient: boolean): void {

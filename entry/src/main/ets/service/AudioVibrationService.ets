@@ -11,6 +11,7 @@
 import { GamepadManager } from './input/GamepadManager';
 import { RUMBLE_MAX } from './input/GamepadTypes';
 import { AudioHapticFrame, AudioHapticFrameFlag } from './AudioHapticFrame';
+import { RazerKishiHaptics } from './usbdriver/RazerKishiHaptics';
 
 interface UsbMotorPair {
   low: number;
@@ -24,15 +25,21 @@ interface UsbMotorPair {
  * device capability fallback, user strength and device/USB routing.
  */
 export class AudioVibrationService {
-  private static readonly MINIMUM_INTENSITY: number = 4;
+  // 参考 PeaSyo 连续转发音频触觉流的模式：原先 100ms 节流 + 幅度迟滞 8
+  // 会把雨声、脚步这类细密连续变化全部抹平（最多只有 10Hz 更新）。
+  private static readonly MINIMUM_INTENSITY: number = 2;
   private static readonly TRANSIENT_MINIMUM_INTERVAL_MS: number = 12;
-  private static readonly CONTINUOUS_MINIMUM_INTERVAL_MS: number = 100;
-  private static readonly CONTINUOUS_AMPLITUDE_HYSTERESIS: number = 8;
+  private static readonly CONTINUOUS_MINIMUM_INTERVAL_MS: number = 25;
+  private static readonly CONTINUOUS_AMPLITUDE_HYSTERESIS: number = 2;
   private static readonly MAXIMUM_PRESENTATION_DELAY_MS: number = 300;
+  // 整体输出增益：音频触觉默认映射偏保守（高频连续分量仅 0.25x），
+  // 拉到 1.7 让同样的 AhHapticFrame 产生更接近 DS5 的满幅马达输出。
+  // toRumbleMotor / 混音 headroom 会限幅到 RUMBLE_MAX，不会溢出。
+  private static readonly OUTPUT_GAIN: number = 1.7;
   // Safety bound for platforms or controllers that keep the last vibration until explicitly cleared.
   private static readonly CONTINUOUS_OUTPUT_WATCHDOG_MS: number = 1200;
-  private static readonly DEFAULT_ONSET_SENSITIVITY: number = 1.0;
-  private static readonly MUSIC_ONSET_SENSITIVITY: number = 2.5;
+  private static readonly DEFAULT_ONSET_SENSITIVITY: number = 1.6;
+  private static readonly MUSIC_ONSET_SENSITIVITY: number = 3.0;
 
   private enabled: boolean = false;
   private strength: number = 100;
@@ -278,6 +285,14 @@ export class AudioVibrationService {
     continuousChanged: boolean): void {
     const lowRatio = Math.max(0, Math.min(1, lowBandRatio / 100));
     const normalizedSharpness = Math.max(0, Math.min(1, sharpness));
+    // 把本地音频分析出的锐度/瞬态/颗粒度交给雷蛇波形合成器。
+    // 两个马达标量只能表达「有多强」，这四个特征才能表达「是什么声音」。
+    const transientUnit = hasTransient
+      ? Math.max(0, Math.min(1, transient / 100)) : 0;
+    const texture = Math.min(1, normalizedSharpness * 0.7 + transientUnit * 0.3);
+    RazerKishiHaptics.getInstance().setTimbre(
+      normalizedSharpness, transientUnit, texture, !hasTransient
+    );
     // Standard rumble exposes frequency motors, not independent left/right
     // haptic channels. Keep stereoPan as a bounded spatial hint only.
     const spatialFactor = ((stereoBalance - 50) / 50) * 0.3;
@@ -317,18 +332,18 @@ export class AudioVibrationService {
 
   private mapContinuousUsbMotors(intensity: number, lowRatio: number,
     spatialFactor: number): UsbMotorPair {
-    const amplitude = intensity / 100;
+    const amplitude = (intensity / 100) * AudioVibrationService.OUTPUT_GAIN;
     return {
       low: this.toRumbleMotor(
         amplitude * (0.55 + 0.45 * lowRatio) * (1 - spatialFactor)),
       high: this.toRumbleMotor(
-        amplitude * (1 - lowRatio) * 0.25 * (1 + spatialFactor))
+        amplitude * (1 - lowRatio) * 0.55 * (1 + spatialFactor))
     };
   }
 
   private mapTransientUsbMotors(intensity: number, lowRatio: number,
     sharpness: number, spatialFactor: number): UsbMotorPair {
-    const amplitude = intensity / 100;
+    const amplitude = (intensity / 100) * AudioVibrationService.OUTPUT_GAIN;
     return {
       low: this.toRumbleMotor(
         amplitude * (0.25 + 0.75 * lowRatio) *
@@ -393,6 +408,7 @@ export class AudioVibrationService {
     this.lastRenderedContinuousIntensity = 0;
     this.lastTransientSubmitTimeMs = 0;
     this.lastContinuousSubmitTimeMs = 0;
+    RazerKishiHaptics.getInstance().setTimbre(0, 0, 0, true);
   }
 
   private stopDeviceVibration(): void {

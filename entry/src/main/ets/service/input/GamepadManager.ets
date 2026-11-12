@@ -21,13 +21,14 @@ import {
 import { SettingsService, SettingsKeys } from '../SettingsService';
 import { PreferencesUtil } from '../../utils/PreferencesUtil';
 import { DeviceSensorService, LI_MOTION_TYPE_ACCEL, LI_MOTION_TYPE_GYRO } from './DeviceSensorService';
-import { MoonBridge, Ds5HapticsIrV2Frame, AdaptiveTriggersFrame,
+import { MoonBridge, Ds5HapticsIrV2Frame, Ds5HapticsPcmFrame, AdaptiveTriggersFrame,
   TOUCH_EVENT_DOWN, TOUCH_EVENT_MOVE, TOUCH_EVENT_UP, TOUCH_EVENT_CANCEL,
   LI_BATTERY_STATE_UNKNOWN, LI_BATTERY_STATE_DISCHARGING, LI_BATTERY_STATE_CHARGING,
   LI_BATTERY_STATE_NOT_CHARGING, LI_BATTERY_STATE_FULL, LI_BATTERY_PERCENTAGE_UNKNOWN
 } from '../streaming/MoonBridge';
 import { MouseEmulationService, MouseEmulationCallback } from './MouseEmulationService';
 import { GamepadVibrationService } from './GamepadVibrationService';
+import { RazerKishiRawHaptics } from '../usbdriver/RazerKishiRawHaptics';
 import { AudioHapticFrameFlag } from '../AudioHapticFrame';
 import {
   GamepadState, GamepadInfo, GamepadInputListener, DeviceBusType,
@@ -1295,9 +1296,17 @@ export class GamepadManager implements UsbDriverListener {
       // device types as gamepads solely because they arrived through GCK.
       // InputKit's joystick source also keeps hybrid keyboard/gamepads valid.
       if (info.deviceType !== 1) {
-        Logger.info('GamepadManager', '[GAMEPAD-GC] 未明确识别为手柄，验证设备源类型: "' +
-          info.name + '" (type=' + info.deviceType + ')');
-        this.verifyAndRegisterGCDevice(deviceId, info, connectionGeneration, lifecycleGeneration);
+        // GCK 原生手柄（如蓝牙 Xbox / Sony / Nintendo）通常不出现在 InputDevice
+        // 列表里，导致下方 verifyAndRegisterGCDevice 的 joystick 源校验误杀。
+        // 对已知手柄品牌，直接信任 GCK 的 deviceConnected 事件并注册。
+        if (this.isKnownGamepadByName(deviceNameLower)) {
+          Logger.info('GamepadManager', `[GAMEPAD-GC] 已知手柄品牌(${info?.name})，信任 GCK 直接注册`);
+          this.registerGCDevice(deviceId, info);
+        } else {
+          Logger.info('GamepadManager', '[GAMEPAD-GC] 未明确识别为手柄，验证设备源类型: "' +
+            info.name + '" (type=' + info.deviceType + ')');
+          this.verifyAndRegisterGCDevice(deviceId, info, connectionGeneration, lifecycleGeneration);
+        }
         return;
       }
 
@@ -1386,6 +1395,27 @@ export class GamepadManager implements UsbDriverListener {
         Logger.info('GamepadManager', '[GAMEPAD] 无手柄连接，暂停输入监听（设备监听保持活跃）');
       }
     }
+  }
+
+  /**
+   * 判断名称是否命中已知手柄品牌。GCK 原生蓝牙手柄（Xbox/Sony/Nintendo/Steam 等）
+   * 通常不暴露为 InputDevice，会在 verifyAndRegisterGCDevice 的 joystick 源校验中被误杀，
+   * 因此对已知品牌直接信任 GCK 的 deviceConnected 事件并注册。
+   */
+  private isKnownGamepadByName(nameLower: string): boolean {
+    return nameLower.includes('xbox') ||
+      nameLower.includes('sony') ||
+      nameLower.includes('dualsense') ||
+      nameLower.includes('dualshock') ||
+      nameLower.includes('nintendo') ||
+      nameLower.includes('switch') ||
+      nameLower.includes('pro controller') ||
+      nameLower.includes('steam') ||
+      nameLower.includes('8bitdo') ||
+      nameLower.includes('gamesir') ||
+      nameLower.includes('razer') ||
+      nameLower.includes('gamepad') ||
+      nameLower.includes('wireless controller');
   }
 
   /**
@@ -2782,6 +2812,22 @@ export class GamepadManager implements UsbDriverListener {
    */
   handleDs5HapticsIrV2(frame: Ds5HapticsIrV2Frame): void {
     this.vibrationService.handleDs5HapticsIrV2(frame);
+  }
+
+  /**
+   * 主机原始 DualSense 触觉波形。优先于 IR v2：一旦收到 PCM，
+   * mixer 会让波形帧接管雷蛇驱动，停止用统计标量重建震动。
+   */
+  handleDs5HapticsPcm(frame: Ds5HapticsPcmFrame): void {
+    this.vibrationService.handleDs5HapticsPcm(frame);
+  }
+
+  /**
+   * v23: native 直出的 PeaSyo 同款 64B raw 触感帧（48k→4k 重采样打包）。
+   * 直接交给 raw-PCM 驱动经 Interface 3 直发执行器；与 0x0E 合成路径解耦。
+   */
+  handleRazerRawHaptic(frames: Uint8Array): void {
+    RazerKishiRawHaptics.getInstance().onRawHapticFrames(frames);
   }
 
   /** Route a raw DualSense adaptive trigger update to its controller slot. */

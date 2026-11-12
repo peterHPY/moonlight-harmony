@@ -48,6 +48,7 @@ import {
   LI_CCAP_BATTERY_STATE,
   LI_CCAP_ACCEL,
   LI_CCAP_GYRO,
+  LI_CCAP_DS5_HAPTICS_PCM,
   LI_FF_CONTROLLER_TOUCH_EVENTS,
   LI_FF_DYNAMIC_SDR_WHITE,
   LI_ERR_UNSUPPORTED,
@@ -64,6 +65,7 @@ import {
   KEY_ACTION_UP,
   STAGE_NAME_RESOLUTION,
   Ds5HapticsIrV2Frame,
+  Ds5HapticsPcmFrame,
   AdaptiveTriggersFrame
 } from './MoonBridge';
 import nativeLib from 'libmoonlight_nativelib.so';
@@ -269,6 +271,9 @@ interface StreamCallbacks {
     maxFullFrameLuminance: number) => void;
   rumble?: (controllerNumber: number, lowFreqMotor: number, highFreqMotor: number) => void;
   ds5HapticsIrV2?: (frame: Ds5HapticsIrV2Frame) => void;
+  ds5HapticsPcm?: (frame: Ds5HapticsPcmFrame) => void;
+  /** v23: native 重采样打包的 PeaSyo 同款 64B raw 触感帧（48k→4k），直发雷蛇 Interface 3。 */
+  razerRawHaptic?: (frames: Uint8Array) => void;
   setAdaptiveTriggers?: (frame: AdaptiveTriggersFrame) => void;
   rumbleTriggers?: (controllerNumber: number, leftTrigger: number, rightTrigger: number) => void;
   setMotionEventState?: (controllerNumber: number, motionType: number, reportRateHz: number) => void;
@@ -541,6 +546,20 @@ export class StreamingSession implements Ds5TouchpadInputSink {
   private hostFeatureFlagsKnown: boolean = false;
   /** 屏幕触控板 clickpad 的粘滞状态，独立于各来源的完整手柄快照。 */
   private ds5TouchpadButtonPressed: boolean = false;
+  /** 主机是否发过 DS5 专属反馈（自适应扳机 / 触觉 / 扳机震动），用于确认 DS5 会话。 */
+  private ds5FeedbackSeen: boolean = false;
+  /** 物理手柄是否上报过 Kishi L4/R4 映射出来的 TOUCHPAD_FLAG。 */
+  private kishiPaddleSeen: boolean = false;
+  /**
+   * 槽位 0 最近一次 arrival 实际发出去的按键掩码。
+   * v69: L4/R4 首次按下时原来**无条件**重发 arrival（先发移除包再发到达包），
+   * 实测这会让主机销毁并重建虚拟 DS5 —— 游戏写触觉音轨的四声道端点随之失效，
+   * 0x550A 仍在发包但内容恒为全零，震动永久消失直到重开会话。
+   * 因此必须先看这个掩码里到底有没有 TOUCHPAD_FLAG：已经有了就什么都不做。
+   */
+  private primaryAdvertisedButtons: number = 0;
+  /** 槽位 0 最近一次 arrival 实际声明的能力位；用于判断重建是否真的必要。 */
+  private primaryAdvertisedCaps: number = 0;
   /** 每个槽位最近一次完整状态，触控板点击必须在此状态上合并。 */
   private controllerStates: Map<number, ControllerState> = new Map();
   private physicalControllerTypes: Map<number, number> = new Map();
@@ -1046,6 +1065,21 @@ export class StreamingSession implements Ds5TouchpadInputSink {
     return (this.hostFeatureFlags & LI_FF_CONTROLLER_TOUCH_EVENTS) !== 0;
   }
 
+  /**
+   * 本次串流是否按 DS5 语义解释手柄输入。
+   * 客户端无法直接读取主机虚拟出的手柄型号，用三类信号判定：
+   * 1) 主机宣告 controller-touch 扩展（Sunshine DS5 sidecar）；
+   * 2) 主机发过 DS5 专属反馈（自适应扳机 / 触觉 / 扳机震动）；
+   * 3) 用户显式开启 DS5 触摸板模式。
+   * L4/R4 只有在 arrival 里声明了 TOUCHPAD_FLAG 才会被主机采纳。
+   */
+  isDs5GamepadSession(): boolean {
+    if (!this.isRunning) return false;
+    if (this.ds5TouchpadEnabled || this.ds5FeedbackSeen) return true;
+    if (!this.hostFeatureFlagsKnown) this.readHostFeatureFlags();
+    return (this.hostFeatureFlags & LI_FF_CONTROLLER_TOUCH_EVENTS) !== 0;
+  }
+
   private readHostFeatureFlags(): number {
     try {
       this.hostFeatureFlags = this.nativeModule.getHostFeatureFlags();
@@ -1142,6 +1176,28 @@ export class StreamingSession implements Ds5TouchpadInputSink {
       controllerIndex = 0;
     }
 
+    // Kishi Ultra 的 L4/R4 上报为 TOUCHPAD_FLAG。
+    // v69 关键修正：原实现在**首次**按下时无条件重发 arrival（内部先发一个
+    // 「槽位 0 移除」包，再发到达包）。实机日志证明这一步是纯破坏：
+    //   22:51:38.878 按下 L4/R4 → 立即 reap 槽位 0 → 主机销毁并重建虚拟 DS5
+    //   → 游戏写触觉的四声道端点失效 → 0x550A 仍在发包但 rawPeak 恒 0.0000
+    //   → 震动永久消失（直到重开会话）。
+    // 而重发前后 caps 都是 0x233、按键掩码也相同 —— 什么都没多声明。
+    // 正确做法：只有当已发出的 arrival 里**确实没有** TOUCHPAD_FLAG 时才需要补声明；
+    // DS5 会话下 isDs5GamepadSession() 本来就为真，首次 arrival 已带该位，
+    // 这里应当直接跳过，绝不能为了一个按键位重建设备。
+    if ((buttons & TOUCHPAD_FLAG) !== 0 && !this.kishiPaddleSeen) {
+      this.kishiPaddleSeen = true;
+      const alreadyAdvertised = (this.primaryAdvertisedButtons & TOUCHPAD_FLAG) !== 0;
+      Logger.info('StreamingSession', `[Gamepad] 检测到 Kishi L4/R4 扩展键, DS5会话=${this.isDs5GamepadSession()}, ` +
+        `已声明触摸板按键=${alreadyAdvertised ? 1 : 0}`);
+      if (!alreadyAdvertised && controllerIndex === 0 && this.physicalControllerArrived.has(0)) {
+        // 仅此路径才补声明；代价是主机重建该槽位（触觉端点会重置），日志留痕便于排查。
+        Logger.warn('StreamingSession', '[Gamepad] 首次 arrival 未声明 TOUCHPAD_FLAG, 重发 arrival 补声明（会重建槽位，触觉可能重置）');
+        this.reannouncePrimaryController(controllerType);
+      }
+    }
+
     this.ensurePhysicalControllerArrival(controllerIndex, controllerType);
     const state: ControllerState = {
       buttonFlags: buttons,
@@ -1165,6 +1221,20 @@ export class StreamingSession implements Ds5TouchpadInputSink {
     controllerType: number = CONTROLLER_TYPE_XBOX
   ): void {
     if (!this.isRunning || !this.physicalControllerArrived.has(controllerIndex)) return;
+    // v69: 重建槽位 = 主机销毁并重建虚拟 DS5 = 游戏写触觉的四声道端点失效。
+    // 实测重建后 0x550A 仍在发包但 rawPeak 恒 0，震动永久消失直到重开会话。
+    // 所以只有**确实新增**了能力位才值得付这个代价；能力没变就什么都不做。
+    if (controllerIndex === 0) {
+      const gm = GamepadManager.getInstance();
+      const wantCaps = gm.getSensorCapabilities(0) |
+        (gm.getPhysicalControllerCapabilities(0) &
+          (LI_CCAP_TOUCHPAD | LI_CCAP_BATTERY_STATE));
+      if ((wantCaps & ~this.primaryAdvertisedCaps) === 0) {
+        Logger.info('StreamingSession',
+          `[Gamepad] 能力未变化，跳过重新声明 (caps=0x${this.primaryAdvertisedCaps.toString(16)})`);
+        return;
+      }
+    }
     if (controllerIndex === 0 && this.virtualControllerArrived) {
       this.reannouncePrimaryController(controllerType);
       return;
@@ -1606,16 +1676,31 @@ export class StreamingSession implements Ds5TouchpadInputSink {
         // IR callbacks use a separate TSFN and may arrive after termination;
         // never let stale work restart a stopped session's vibration source.
         if (!this.isRunning) return;
+        this.ds5FeedbackSeen = true;
         GamepadManager.getInstance().handleDs5HapticsIrV2(frame);
+      },
+      ds5HapticsPcm: (frame: Ds5HapticsPcmFrame): void => {
+        // 主机原始触觉波形：优先于 IR v2。单独的 TSFN，同样要防止会话结束后
+        // 的迟到帧重新点亮震动。
+        if (!this.isRunning) return;
+        this.ds5FeedbackSeen = true;
+        GamepadManager.getInstance().handleDs5HapticsPcm(frame);
+      },
+      razerRawHaptic: (frames: Uint8Array): void => {
+        // 预留：主机侧原始触觉帧通道；当前正式链路是 0x0E 软件合成。
+        if (!this.isRunning) return;
+        GamepadManager.getInstance().handleRazerRawHaptic(frames);
       },
       setAdaptiveTriggers: (frame: AdaptiveTriggersFrame): void => {
         // This callback owns a separate TSFN and may already be queued when the
         // session ends. Never apply stale trigger state to the next session.
         if (!this.isRunning) return;
+        this.ds5FeedbackSeen = true;
         GamepadManager.getInstance().handleAdaptiveTriggers(frame);
       },
       rumbleTriggers: (cn: number, lt: number, rt: number): void => {
         if (!this.isRunning) return;
+        this.ds5FeedbackSeen = true;
         GamepadManager.getInstance().handleRumbleTriggers(cn, lt, rt);
       },
       setMotionEventState: (cn: number, motionType: number, rateHz: number): void => {
@@ -1963,12 +2048,17 @@ export class StreamingSession implements Ds5TouchpadInputSink {
 
     this.activeGamepadMask |= (1 << controllerIndex);
     const touchpadEnabled = this.ds5TouchpadEnabled;
-    const supportedButtons = touchpadEnabled
+    // DS5 会话或物理 Kishi 背键需要主机认识 TOUCHPAD_FLAG（触摸板按下）
+    const advertiseTouchpadButton: boolean = touchpadEnabled || this.isDs5GamepadSession() || this.kishiPaddleSeen;
+    const supportedButtons = advertiseTouchpadButton
       ? STANDARD_BUTTON_FLAGS | TOUCHPAD_FLAG
       : STANDARD_BUTTON_FLAGS;
     const controllerType = touchpadEnabled ? CONTROLLER_TYPE_PS : CONTROLLER_TYPE_XBOX;
+    // 屏幕触摸板可能先于物理手柄抢占 slot 0，之后物理 arrival 会直接复用
+    // 本次的能力位。因此两条 arrival 路径都必须声明原始 DS5 触觉 PCM 能力，
+    // 否则主机不会选择物理 DualSense 模式，也不会发送 opcode 0x550A。
     const capabilities = LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_RUMBLE |
-      (touchpadEnabled ? LI_CCAP_TOUCHPAD : 0);
+      LI_CCAP_DS5_HAPTICS_PCM | (touchpadEnabled ? LI_CCAP_TOUCHPAD : 0);
     const ret = this.nativeModule.sendControllerArrivalEvent(
       controllerIndex, this.activeGamepadMask,
       controllerType, supportedButtons, capabilities
@@ -1976,6 +2066,10 @@ export class StreamingSession implements Ds5TouchpadInputSink {
 
     if (ret >= 0) {
       this.virtualControllerArrived = true;
+      if (controllerIndex === 0) {
+        this.primaryAdvertisedButtons = supportedButtons;
+        this.primaryAdvertisedCaps = capabilities;
+      }
       Logger.info('StreamingSession', `[VirtualCtrl] arrival sent, index=${controllerIndex}, mask=0x${this.activeGamepadMask.toString(16)}`);
     } else {
       Logger.warn('StreamingSession', `[VirtualCtrl] arrival failed (ret=${ret}), will retry`);
@@ -1996,11 +2090,18 @@ export class StreamingSession implements Ds5TouchpadInputSink {
     }
 
     let capabilities = LI_CCAP_ANALOG_TRIGGERS | LI_CCAP_RUMBLE;
+    // 声明可渲染主机原始 DualSense 立体声触觉波形，主机才会选择物理
+    // DualSense 模式并在控制流上发送 opcode 0x550A 的 PCM 包。
+    capabilities |= LI_CCAP_DS5_HAPTICS_PCM;
     capabilities |= GamepadManager.getInstance().getSensorCapabilities(controllerIndex);
     // 物理触摸板/电池能力（USB DS5）；位值与 ControllerCapabilities 对齐
     const physicalCaps = GamepadManager.getInstance().getPhysicalControllerCapabilities(controllerIndex);
     const hasPhysicalTouchpad = (physicalCaps & LI_CCAP_TOUCHPAD) !== 0;
-    if (hasPhysicalTouchpad || (this.ds5TouchpadEnabled && controllerIndex === 0)) {
+    // 触摸板「能力」（触点数据）与触摸板「按钮」分开声明：Kishi 没有物理触摸板，
+    // 但 DS5 会话下需要让主机接受 L4/R4 映射出来的 TOUCHPAD_FLAG。
+    const touchpadCapable = hasPhysicalTouchpad || (this.ds5TouchpadEnabled && controllerIndex === 0);
+    const advertiseTouchpadButton: boolean = touchpadCapable || this.isDs5GamepadSession() || this.kishiPaddleSeen;
+    if (touchpadCapable) {
       capabilities |= LI_CCAP_TOUCHPAD;
     }
     if ((physicalCaps & LI_CCAP_BATTERY_STATE) !== 0) {
@@ -2018,20 +2119,25 @@ export class StreamingSession implements Ds5TouchpadInputSink {
     }
 
     this.activeGamepadMask |= (1 << controllerIndex);
+    const supportedButtons = advertiseTouchpadButton
+      ? STANDARD_BUTTON_FLAGS | TOUCHPAD_FLAG
+      : STANDARD_BUTTON_FLAGS;
     const ret = this.nativeModule.sendControllerArrivalEvent(
       controllerIndex, this.activeGamepadMask,
       reportedType,
-      (hasPhysicalTouchpad || (this.ds5TouchpadEnabled && controllerIndex === 0))
-        ? STANDARD_BUTTON_FLAGS | TOUCHPAD_FLAG
-        : STANDARD_BUTTON_FLAGS,
+      supportedButtons,
       capabilities
     );
 
     if (ret >= 0) {
       this.physicalControllerArrived.add(controllerIndex);
       this.physicalControllerTypes.set(controllerIndex, controllerType);
+      if (controllerIndex === 0) {
+        this.primaryAdvertisedButtons = supportedButtons;
+        this.primaryAdvertisedCaps = capabilities;
+      }
       Logger.info('StreamingSession', `[Gamepad] arrival: index=${controllerIndex}, type=${reportedType}(orig=${controllerType}), ` +
-        `caps=0x${capabilities.toString(16)}, mask=0x${this.activeGamepadMask.toString(16)}`);
+        `caps=0x${capabilities.toString(16)}, mask=0x${this.activeGamepadMask.toString(16)}, buttons=0x${supportedButtons.toString(16)}`);
     }
   }
 
@@ -2043,6 +2149,10 @@ export class StreamingSession implements Ds5TouchpadInputSink {
     this.hostFeatureFlags = 0;
     this.hostFeatureFlagsKnown = false;
     this.ds5TouchpadButtonPressed = false;
+    this.ds5FeedbackSeen = false;
+    this.kishiPaddleSeen = false;
+    this.primaryAdvertisedButtons = 0;
+    this.primaryAdvertisedCaps = 0;
     this.controllerStates.clear();
     this.controllerState.buttonFlags = 0;
     this.controllerState.leftTrigger = 0;
@@ -2097,6 +2207,11 @@ export class StreamingSession implements Ds5TouchpadInputSink {
     const hadPhysical = this.physicalControllerArrived.has(0);
     const hadSlot = hadPhysical || this.virtualControllerArrived || (this.activeGamepadMask & 1) !== 0;
     if (!hadSlot) return;
+
+    // v69: 这条路径会让主机销毁并重建虚拟 DS5，游戏写触觉的四声道端点随之失效
+    // （0x550A 仍发包但内容恒零，震动不会自己恢复）。属高成本操作，必须留痕。
+    Logger.warn('StreamingSession',
+      `[Gamepad] 重建槽位 0（会重置主机侧 DS5 触觉端点）: hadPhysical=${hadPhysical ? 1 : 0}`);
 
     const remainingMask = this.activeGamepadMask & ~1;
     this.nativeModule.sendMultiControllerInput(0, remainingMask, 0, 0, 0, 0, 0, 0, 0);
