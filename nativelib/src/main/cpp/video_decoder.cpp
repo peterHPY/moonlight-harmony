@@ -179,6 +179,9 @@ static bool g_syncApiAvailable = false;
 // =============================================================================
 static const char* key_enable_sync_mode = nullptr;
 static const char* key_vrr_enable = nullptr;
+// API 26+: 按解码顺序输出（跳过显示序重排缓冲 DPB reorder），缩短解码→呈现管线延迟。
+// 该键是 extern const char*，低版本设备无此符号，必须 dlsym 运行时解析。
+static const char* key_decoder_output_in_decoding_order = nullptr;
 static bool g_mediaKeysLoaded = false;
 
 // AV1 MIME (API 23+) must be loaded dynamically so older runtimes can still load this module.
@@ -329,8 +332,14 @@ static void TryLoadMediaKeys() {
     const char** pSync = (const char**)dlsym(RTLD_DEFAULT, "OH_MD_KEY_ENABLE_SYNC_MODE");
     if (pSync) key_enable_sync_mode = *pSync;
     
+    // OH_MD_KEY_VIDEO_DECODER_OUTPUT_IN_DECODING_ORDER (API 26+)
+    // 1 = 解码器按解码顺序输出帧，跳过显示序重排缓冲；0(默认) = 按显示顺序输出。
+    const char** pDecOrder = (const char**)dlsym(RTLD_DEFAULT,
+        "OH_MD_KEY_VIDEO_DECODER_OUTPUT_IN_DECODING_ORDER");
+    if (pDecOrder) key_decoder_output_in_decoding_order = *pDecOrder;
+    
     // 如果 RTLD_DEFAULT 找不到，尝试从 libnative_media_codecbase.so 显式加载
-    if (!pVrr || !pSync) {
+    if (!pVrr || !pSync || !pDecOrder) {
         void* codecbaseHandle = dlopen("libnative_media_codecbase.so", RTLD_NOW);
         if (codecbaseHandle != nullptr) {
             if (!pVrr) {
@@ -341,12 +350,18 @@ static void TryLoadMediaKeys() {
                 pSync = (const char**)dlsym(codecbaseHandle, "OH_MD_KEY_ENABLE_SYNC_MODE");
                 if (pSync) key_enable_sync_mode = *pSync;
             }
+            if (!pDecOrder) {
+                pDecOrder = (const char**)dlsym(codecbaseHandle,
+                    "OH_MD_KEY_VIDEO_DECODER_OUTPUT_IN_DECODING_ORDER");
+                if (pDecOrder) key_decoder_output_in_decoding_order = *pDecOrder;
+            }
         }
     }
     
-    OH_LOG_INFO(LOG_APP, "Media keys availability: VRR_ENABLE=%{public}s, SYNC_MODE=%{public}s",
+    OH_LOG_INFO(LOG_APP, "Media keys availability: VRR_ENABLE=%{public}s, SYNC_MODE=%{public}s, DECODING_ORDER=%{public}s",
                 key_vrr_enable ? key_vrr_enable : "N/A",
-                key_enable_sync_mode ? key_enable_sync_mode : "N/A");
+                key_enable_sync_mode ? key_enable_sync_mode : "N/A",
+                key_decoder_output_in_decoding_order ? key_decoder_output_in_decoding_order : "N/A");
 }
 
 // 视频格式掩码（来自 moonlight-common-c/Limelight.h）
@@ -361,7 +376,12 @@ static void TryLoadMediaKeys() {
 // 缓冲区配置
 static constexpr int kMinBufferCount = 2;       // 最小缓冲区数（双缓冲）
 static constexpr int kMaxBufferCount = 8;       // 最大缓冲区数
-static constexpr int kAutoBufferCount = 2;      // 自动模式下，默认统一使用 2
+static constexpr int kAutoBufferCount = 2;      // 自动模式下，默认统一使用 2（解码器硬件缓冲）
+// 软件待解码队列深度：仅作用于同步模式的 pendingFrameQueue_，用于吸收网络突发。
+// 原值跟随 kAutoBufferCount=2，在 2560x1600@120 下轻微突发即触发队列溢出 → 强制 IDR 重同步
+// （表现为偶发画面冻结/卡顿）。提升到 5 可在不改变解码器硬件缓冲（不影响端到端延迟）的前提下，
+// 吸收绝大多数网络突发，从源头消除"队列溢出→IDR→冻结"。
+static constexpr int kSoftwareQueueDepth = 5;
 static constexpr int kHighFpsThreshold = 60;    // 高帧率阈值
 static constexpr int kHighFpsMaxBuffers = 4;    // 高帧率时最大缓冲区数
 
@@ -566,16 +586,18 @@ int VideoDecoder::Init(const VideoDecoderConfig& config, OHNativeWindow* window)
     
     OH_LOG_INFO(LOG_APP, "{Init} Format created, setting parameters...");
     
-    // 设置帧率 - 这让解码器知道预期的输入速率
-    // 报告 2 倍实际帧率，防止硬件 VPU 在静态内容时降频
-    // 类似 Android 的 KEY_OPERATING_RATE = Short.MAX_VALUE 策略：
-    // 当画面静止时，帧数据很小（可能仅几百字节），VPU 可能进入节能模式降低时钟频率。
-    // 当突然出现复杂画面（如打开动画），VPU 频率提升有延迟，导致前几帧解码变慢产生卡顿。
-    // 报告更高帧率可以让 VPU 保持较高的工作频率，避免静态↔动态切换时的"冷启动"卡顿。
-    double reportedFps = config_.fps * 2.0;
+    // 帧率上报收敛（低延迟优化 #3）
+    // 旧策略：上报 2x 实际帧率，防止硬件 VPU 在静态内容时降频。
+    //   代价：覆盖层"解码延迟"统计依赖 config_.fps 计算帧间隔，2x 上报会人为抬高基准，
+    //   让真实解码耗时看起来比实际更"宽松"，覆盖层数字失真。
+    // 新策略（默认 reportTrueFps=true）：直接上报真实 FPS，使覆盖层解码延迟显示更贴近真实值，
+    //   并让解码器按真实节奏调度。若某些设备出现静态→动态切换的 VPU 冷启动卡顿，
+    //   可关闭 reportTrueFps 回退到 2x 旧策略（见 VideoDecoderConfig）。
+    double reportedFps = config_.reportTrueFps ? config_.fps : (config_.fps * 2.0);
     OH_AVFormat_SetDoubleValue(format, OH_MD_KEY_FRAME_RATE, reportedFps);
-    OH_LOG_INFO(LOG_APP, "{Init} Reporting FPS %.2f to decoder (actual=%.2f, 2x to prevent VPU throttling)",
-                reportedFps, config_.fps);
+    OH_LOG_INFO(LOG_APP, "{Init} Reporting FPS %.2f to decoder (actual=%.2f, %s)",
+                reportedFps, config_.fps,
+                config_.reportTrueFps ? "true fps (converged)" : "2x fallback (anti-VPU-throttle)");
     
     // 预分配足够大的输入缓冲区
     // 静态内容时帧可能仅几百字节，运动开始时帧可能达到数百 KB。
@@ -610,7 +632,36 @@ int VideoDecoder::Init(const VideoDecoderConfig& config, OHNativeWindow* window)
     } else {
         OH_LOG_INFO(LOG_APP, "{Init} VRR mode disabled");
     }
-    
+
+    // =====================================================================
+    // [API 26+] 解码顺序输出（Decoding-order output）— 缩短解码→呈现管线延迟
+    // ---------------------------------------------------------------------
+    // 默认 0：解码器按"显示顺序"输出，需等 DPB 重排缓冲攒够重排帧再吐帧。
+    // 设为 1：按"解码顺序"直接输出，跳过显示序重排，帧更早到达呈现层。
+    // 三重保险，任一不满足都不启用（官方文档：不支持该特性时设键会让
+    // OH_VideoDecoder_Configure 返回 AV_ERR_INVALID_VAL）：
+    //   ① 键符号存在（API 26+ 系统，已由 TryLoadMediaKeys 解析）
+    //   ② 该 MIME 的硬件解码器声明支持该特性（OH_AVCapability_IsFeatureSupported）
+    //   ③ 下方 Configure 若因此键被拒，自动把键置 0 重试一次
+    // 注：枚举值 8 = VIDEO_DECODER_OUTPUT_IN_DECODING_ORDER，用强转避免依赖
+    //     编译期 SDK 头文件版本（低版本 SDK 没有这个枚举符号名）。
+    // =====================================================================
+    bool decodingOrderEnabled = false;
+    if (key_decoder_output_in_decoding_order != nullptr) {
+        bool featSupported = OH_AVCapability_IsFeatureSupported(
+            hwCapability, (OH_AVCapabilityFeature)8);  // VIDEO_DECODER_OUTPUT_IN_DECODING_ORDER
+        if (featSupported) {
+            OH_AVFormat_SetIntValue(format, key_decoder_output_in_decoding_order, 1);
+            decodingOrderEnabled = true;
+            OH_LOG_INFO(LOG_APP, "{Init} Decoding-order output ENABLED (skip DPB display reorder)");
+        } else {
+            OH_LOG_INFO(LOG_APP, "{Init} Decoding-order output NOT supported by %{public}s, keep display order",
+                        decoderName);
+        }
+    } else {
+        OH_LOG_INFO(LOG_APP, "{Init} Decoding-order output key unavailable (API < 26), keep display order");
+    }
+
     // 同步模式配置（API 20+）
     // 文档说明：使能视频解码同步模式，必须将 OH_MD_KEY_ENABLE_SYNC_MODE 配置为 1
     // 注意：同步模式在调用 Configure 接口前不能调用 RegisterCallback 接口
@@ -669,11 +720,19 @@ int VideoDecoder::Init(const VideoDecoderConfig& config, OHNativeWindow* window)
     // 2) 解码器 input/output buffer 请求值
     // 0 表示自动：默认统一解析为 2。
     int effectiveBufferCount = ResolveEffectiveBufferCount(config_.bufferCount, config_.decoderMode);
-    maxPendingFrames_ = static_cast<size_t>(effectiveBufferCount > 0 ? effectiveBufferCount : kMinBufferCount);
-    OH_LOG_INFO(LOG_APP, "{Init} Queue depth resolved: requested=%{public}d, effective=%{public}d, mode=%{public}s, softwareQueue=%{public}zu",
+
+    // 软件待解码队列深度与解码器硬件缓冲解耦：
+    // - 解码器硬件缓冲沿用原有解析（自动模式=2），保持最低端到端延迟；
+    // - 软件待解码队列默认使用更深的 kSoftwareQueueDepth（5）以吸收网络突发，
+    //   若用户显式指定了 bufferCount，则优先尊重其设置。
+    int softwareQueueDepth = (config_.bufferCount > 0)
+        ? effectiveBufferCount
+        : kSoftwareQueueDepth;
+    maxPendingFrames_ = static_cast<size_t>(softwareQueueDepth > 0 ? softwareQueueDepth : kMinBufferCount);
+    OH_LOG_INFO(LOG_APP, "{Init} Queue depth resolved: requested=%{public}d, decoderBuffers=%{public}d, softwareQueue=%{public}zu, mode=%{public}s",
                 config_.bufferCount, effectiveBufferCount,
-                config_.decoderMode == DecoderMode::SYNC ? "SYNC" : "ASYNC",
-                maxPendingFrames_);
+                maxPendingFrames_,
+                config_.decoderMode == DecoderMode::SYNC ? "SYNC" : "ASYNC");
 
     // 缓冲区配置优化 - 减少管线延迟
     // HarmonyOS 官方 API：
@@ -760,8 +819,20 @@ int VideoDecoder::Init(const VideoDecoderConfig& config, OHNativeWindow* window)
                 static_cast<int>(config_.colorSpace), static_cast<int>(config_.colorRange));
     
     ret = OH_VideoDecoder_Configure(decoder_, format);
+
+    // 第③重保险：能力探测与实际实现偶有不一致时，Configure 可能仍拒绝该键。
+    // 此时把键置 0（回到默认的显示顺序输出）后重试一次，保证新增优化绝不会
+    // 让解码器起不来。format 尚未销毁，可直接复用。
+    if (ret != AV_ERR_OK && decodingOrderEnabled) {
+        OH_LOG_WARN(LOG_APP, "{Init} Configure rejected decoding-order output (ret=%{public}d), retrying with default display order", ret);
+        OH_AVFormat_SetIntValue(format, key_decoder_output_in_decoding_order, 0);
+        ret = OH_VideoDecoder_Configure(decoder_, format);
+        if (ret == AV_ERR_OK) {
+            OH_LOG_WARN(LOG_APP, "{Init} Decoder configured OK after disabling decoding-order output");
+        }
+    }
     OH_AVFormat_Destroy(format);
-    
+
     if (ret != AV_ERR_OK) {
         OH_LOG_ERROR(LOG_APP, "{Init} Failed to configure decoder: %{public}d", ret);
         OH_VideoDecoder_Destroy(decoder_);
@@ -908,7 +979,13 @@ int VideoDecoder::Start() {
     } else {
         OH_LOG_INFO(LOG_APP, "Video decoder started in ASYNC mode");
     }
-    
+
+    // 启动专用送显线程 (DiPlay 模式)：GL 后处理 + 呈现调度在此线程执行，
+    // 与解码回调/同步解码线程解耦，降低解码器输出 buffer 拥塞。
+    outputRunning_ = true;
+    outputThread_ = std::thread(&VideoDecoder::OutputThreadLoop, this);
+    OH_LOG_INFO(LOG_APP, "Video decoder: dedicated output/present thread started");
+
     return 0;
 }
 
@@ -926,6 +1003,20 @@ int VideoDecoder::Stop() {
         if (syncDecodeThread_.joinable()) {
             syncDecodeThread_.join();
         }
+    }
+
+    // 专用送显线程：先唤醒并 join，线程内部会释放仍持有的输出 buffer（不再送显）
+    if (outputRunning_) {
+        outputRunning_ = false;
+        outputCond_.notify_all();
+        if (outputThread_.joinable()) {
+            outputThread_.join();
+        }
+    }
+    // 理论上线程已 drain 完毕，这里做兜底清空
+    {
+        std::lock_guard<std::mutex> lock(outputMutex_);
+        while (!outputQueue_.empty()) outputQueue_.pop();
     }
     
     // 参考官方文档：使用 unique_lock 保护 Stop 操作
@@ -981,7 +1072,13 @@ int VideoDecoder::Flush() {
         while (!inputIndexQueue_.empty()) inputIndexQueue_.pop();
         while (!inputBufferQueue_.empty()) inputBufferQueue_.pop();
     }
-    
+
+    // 清空送显队列（Flush 后旧的输出 buffer 索引已失效，丢弃未送显的帧）
+    {
+        std::lock_guard<std::mutex> lock(outputMutex_);
+        while (!outputQueue_.empty()) outputQueue_.pop();
+    }
+
     // 重新启动
     ret = OH_VideoDecoder_Start(decoder_);
     if (ret != AV_ERR_OK) {
@@ -1222,11 +1319,25 @@ int VideoDecoder::SubmitDecodeUnitScatter(const BufferSegment* segments, int seg
         return recoveryResult;  // -1 = DR_NEED_IDR
     }
 
+    // === 低延迟优化 #2：SPS/VUI 无重排修补（实验特性，默认关闭） ===
+    // 在把码流写入解码器前，定位每个分段的 SPS NAL 并将重排字段清零：
+    //   HEVC: sps_max_num_reorder_pics
+    //   H.264: max_num_reorder_frames (VUI bitstream_restriction)
+    // 强制解码器不使用重排缓冲（真正的 B 帧去除需服务端关闭 B 帧 + closed GOP）。
+    // 仅当 enableSpsReorderPatch 开启且能安全解析时才改写；否则 usePatched=false，
+    // 完全沿用原始分段（零行为变化）。SPS 仅在 IDR/参数变化时出现，开销可忽略。
+    std::vector<uint8_t> patchedBuf_;
+    int patchedLen_ = totalSize;
+    bool usePatched_ = config_.enableSpsReorderPatch &&
+                       BuildPatchedBitstream(segments, segmentCount, totalSize, config_.codec,
+                                            patchedBuf_, patchedLen_);
+    const int effectiveSize = usePatched_ ? patchedLen_ : totalSize;
+
     PresentationTargetGuard presentationTarget(render_, timestamp);
 
     // 同步模式：直接提交到解码器（scatter-gather 直写 AVBuffer）
     if (config_.decoderMode == DecoderMode::SYNC) {
-        UpdateReceivedStats(totalSize, frameNumber, hostProcessingLatency);
+        UpdateReceivedStats(effectiveSize, frameNumber, hostProcessingLatency);
         
         if (!firstFrameReceived_) {
             firstFrameReceived_ = true;
@@ -1247,15 +1358,19 @@ int VideoDecoder::SubmitDecodeUnitScatter(const BufferSegment* segments, int seg
                     uint8_t* bufferAddr = OH_AVBuffer_GetAddr(inputBuffer);
                     if (bufferAddr != nullptr) {
                         int32_t capacity = OH_AVBuffer_GetCapacity(inputBuffer);
-                        if (totalSize > capacity) {
-                            OH_LOG_ERROR(LOG_APP, "Scatter sync: frame too large %{public}d > %{public}d", totalSize, capacity);
+                        if (effectiveSize > capacity) {
+                            OH_LOG_ERROR(LOG_APP, "Scatter sync: frame too large %{public}d > %{public}d", effectiveSize, capacity);
                             return -1;
                         }
                         
-                        // 直接将分段数据写入 AVBuffer（无中间缓冲区）
-                        CopySegmentsToBuffer(bufferAddr, segments, segmentCount);
+                        // 将分段数据（已应用 SPS 无重排修补）写入 AVBuffer
+                        if (usePatched_) {
+                            memcpy(bufferAddr, patchedBuf_.data(), patchedBuf_.size());
+                        } else {
+                            CopySegmentsToBuffer(bufferAddr, segments, segmentCount);
+                        }
                         
-                        auto attr = MakeInputBufferAttr(totalSize, timestamp, frameType);
+                        auto attr = MakeInputBufferAttr(effectiveSize, timestamp, frameType);
                         OH_AVBuffer_SetBufferAttr(inputBuffer, &attr);
                         
                         RecordEnqueueTimestamp(timestamp);
@@ -1277,37 +1392,38 @@ int VideoDecoder::SubmitDecodeUnitScatter(const BufferSegment* segments, int seg
         
         // 直接提交失败，回退到队列（需要合并数据）
         {
-            uint64_t overflowCount = 0;
             std::lock_guard<std::mutex> lock(pendingFrameMutex_);
-            while (pendingFrameQueue_.size() >= maxPendingFrames_) {
-                render_->DiscardPresentationFrame(
-                    pendingFrameQueue_.front().presentationTarget);
-                pendingFrameQueue_.pop();
-                overflowCount++;
+            if (pendingFrameQueue_.size() >= maxPendingFrames_) {
+                // 队列已满：丢弃"最新到达"的帧，而非队首最旧的帧。
+                // 队内帧仍按解码顺序排列、H.264/HEVC 参考链完整（不会破坏后续 P 帧的参考关系，
+                // 故不会产生解码花屏），且不再请求 IDR 重同步。
+                // 配合输出端 drain-to-latest（仅呈现最新解码帧），可在不冻结画面的前提下平滑度过
+                // 网络突发，从根本上消除"队列溢出 → 强制 IDR → 画面冻结"的偶发卡顿。
+                // 真正的解码器停摆仍由 500ms 冻结检测负责请求 IDR（安全网）。
+                RecordDroppedFrames(DropReason::QUEUE_OVERFLOW, 1);
+                OH_LOG_INFO(LOG_APP,
+                            "Scatter sync: queue full (depth=%zu), dropping newest frame (no IDR)",
+                            maxPendingFrames_);
+                // 提前返回：presentationTarget 离开作用域时析构函数自动释放其呈现目标，无资源泄漏。
+                return 0;
             }
-            if (overflowCount > 0) {
-                RecordDroppedFrames(DropReason::QUEUE_OVERFLOW, overflowCount);
-            }
-            
+
             PendingFrame frame;
-            frame.data.resize(totalSize);
-            CopySegmentsToBuffer(frame.data.data(), segments, segmentCount);
+            if (usePatched_) {
+                frame.data = patchedBuf_;
+            } else {
+                frame.data.resize(totalSize);
+                CopySegmentsToBuffer(frame.data.data(), segments, segmentCount);
+            }
             frame.frameNumber = frameNumber;
             frame.frameType = frameType;
             frame.timestamp = timestamp;
             frame.hostProcessingLatency = hostProcessingLatency;
             frame.presentationTarget = presentationTarget.GetTarget();
-            
+
             pendingFrameQueue_.push(std::move(frame));
             pendingFrameCond_.notify_one();
             presentationTarget.Commit();
-            
-            // 队列溢出 = 丢弃了中间 P 帧 → 后续 P 帧缺少参考帧会损坏
-            // 激活恢复模式：丢弃后续 P 帧，等待 IDR 重建参考链
-            if (overflowCount > 0 && !latencyRecoveryActive_.exchange(true)) {
-                LiRequestIdrFrame();
-                OH_LOG_WARN(LOG_APP, "Scatter sync: queue overflow, requesting IDR recovery");
-            }
         }
 
         return 0;
@@ -1356,15 +1472,19 @@ int VideoDecoder::SubmitDecodeUnitScatter(const BufferSegment* segments, int seg
     }
     
     int32_t bufferCapacity = OH_AVBuffer_GetCapacity(inputBuffer);
-    if (totalSize > bufferCapacity) {
-        OH_LOG_ERROR(LOG_APP, "Frame size %{public}d > buffer capacity %{public}d", totalSize, bufferCapacity);
+    if (effectiveSize > bufferCapacity) {
+        OH_LOG_ERROR(LOG_APP, "Frame size %{public}d > buffer capacity %{public}d", effectiveSize, bufferCapacity);
         return -1;
     }
-    
-    // 直接将分段数据写入 AVBuffer
-    CopySegmentsToBuffer(bufferAddr, segments, segmentCount);
-    
-    auto attr = MakeInputBufferAttr(totalSize, timestamp, frameType);
+
+    // 直接将分段数据（已应用 SPS 无重排修补）写入 AVBuffer
+    if (usePatched_) {
+        memcpy(bufferAddr, patchedBuf_.data(), patchedBuf_.size());
+    } else {
+        CopySegmentsToBuffer(bufferAddr, segments, segmentCount);
+    }
+
+    auto attr = MakeInputBufferAttr(effectiveSize, timestamp, frameType);
     OH_AVBuffer_SetBufferAttr(inputBuffer, &attr);
     
     RecordEnqueueTimestamp(timestamp);
@@ -1377,7 +1497,7 @@ int VideoDecoder::SubmitDecodeUnitScatter(const BufferSegment* segments, int seg
 
     presentationTarget.Commit();
 
-    UpdateReceivedStats(totalSize, frameNumber, hostProcessingLatency);
+    UpdateReceivedStats(effectiveSize, frameNumber, hostProcessingLatency);
     
     if (!firstFrameReceived_) {
         firstFrameReceived_ = true;
@@ -1725,8 +1845,436 @@ void VideoDecoder::OnOutputBufferAvailable(OH_AVCodec* codec, uint32_t index,
     // 2. VSync 模式已通过 RenderOutputBufferAtTime 控制呈现时间
     // 3. 低延迟模式应尽快渲染，由显示器 VSync 自然限制
     // 帧率限制通过 SetExpectedFrameRateRange 在系统层面实现
-    
-    self->SubmitDecodedFrame(codec, index, attr, enqueueTimeMs, outputTimeMs);
+    //
+    // 低延迟优化 #1（DiPlay 模式）：此处不再内联调用 SubmitDecodedFrame（GL 后处理 +
+    // 呈现调度），而是将帧送入专用送显线程队列，立即返回解码回调线程，
+    // 避免后处理阻塞解码器输出 buffer 回收。实际送显在 OutputThreadLoop 中完成。
+    self->EnqueueOutput(codec, index, attr, enqueueTimeMs, outputTimeMs);
+}
+
+// =============================================================================
+// 低延迟优化 #1：专用送显线程 (DiPlay 模式)
+// =============================================================================
+
+void VideoDecoder::EnqueueOutput(OH_AVCodec* codec, uint32_t index,
+                                 const OH_AVCodecBufferAttr& attr,
+                                 int64_t enqueueTimeMs, int64_t outputTimeMs) {
+    // outputRunning_ 已关闭（解码器正在停止）时，晚到的帧直接释放，避免 buffer 泄漏
+    if (!outputRunning_) {
+        OH_VideoDecoder_FreeOutputBuffer(codec, index);
+        return;
+    }
+    std::unique_lock<std::mutex> lock(outputMutex_);
+    // 背压：队列满时丢弃最旧的待送显帧（直接释放其输出 buffer，不送显）
+    while (outputQueue_.size() >= maxOutputQueue_) {
+        OutputTask old = std::move(outputQueue_.front());
+        outputQueue_.pop();
+        OH_VideoDecoder_FreeOutputBuffer(old.codec, old.index);
+        RecordDroppedFrames(DropReason::PRESENTATION);
+        OH_LOG_WARN(LOG_APP, "Output queue full, dropped oldest frame (DiPlay backpressure)");
+    }
+    outputQueue_.push(OutputTask{codec, index, attr, enqueueTimeMs, outputTimeMs});
+    outputCond_.notify_one();
+}
+
+void VideoDecoder::OutputThreadLoop() {
+    std::unique_lock<std::mutex> lock(outputMutex_);
+    while (outputRunning_) {
+        outputCond_.wait(lock, [this] { return !outputQueue_.empty() || !outputRunning_; });
+        if (!outputRunning_) break;
+        if (outputQueue_.empty()) continue;
+        OutputTask task = std::move(outputQueue_.front());
+        outputQueue_.pop();
+        lock.unlock();
+        // render_->SubmitFrame（GL 后处理 + 呈现调度）在此专用线程执行，
+        // 不再阻塞解码器回调线程 / 同步解码线程。
+        SubmitDecodedFrame(task.codec, task.index, task.attr,
+                           task.enqueueTimeMs, task.outputTimeMs);
+        lock.lock();
+    }
+    // outputRunning_ 已为 false：释放仍持有的输出 buffer（不再送显）
+    while (!outputQueue_.empty()) {
+        OutputTask task = std::move(outputQueue_.front());
+        outputQueue_.pop();
+        OH_VideoDecoder_FreeOutputBuffer(task.codec, task.index);
+        RecordDroppedFrames(DropReason::PRESENTATION);
+    }
+}
+
+// =============================================================================
+// 低延迟优化 #2：SPS/VUI 无重排修补（实验特性）
+// =============================================================================
+
+namespace {
+// 在 NAL 单元（可能带 Annex-B 起始码）上做位级读写，用于清零重排字段。
+struct BitReader {
+    const uint8_t* data;
+    size_t size;       // 字节数
+    size_t bitpos;     // 当前位偏移
+    bool getBit(uint32_t& bit) {
+        if (bitpos >= size * 8) return false;
+        size_t byte = bitpos / 8;
+        bit = (data[byte] >> (7 - (bitpos % 8))) & 1u;
+        bitpos++;
+        return true;
+    }
+    bool getBits(uint32_t n, uint32_t& val) {
+        val = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t b;
+            if (!getBit(b)) return false;
+            val = (val << 1) | b;
+        }
+        return true;
+    }
+    bool getUe(uint32_t& val) {
+        uint32_t zeros = 0;
+        uint32_t b = 0;
+        while (true) {
+            if (!getBit(b)) return false;
+            if (b == 1) break;
+            zeros++;
+            if (zeros > 31) return false;  // 防呆
+        }
+        if (zeros == 0) { val = 0; return true; }
+        uint32_t rest;
+        if (!getBits(zeros, rest)) return false;
+        val = ((1u << zeros) - 1) + rest;
+        return true;
+    }
+    bool getSe(int32_t& val) {
+        uint32_t ue;
+        if (!getUe(ue)) return false;
+        if (ue & 1) val = static_cast<int32_t>((ue + 1) / 2);
+        else val = -static_cast<int32_t>(ue / 2);
+        return true;
+    }
+};
+
+struct BitWriter {
+    std::vector<uint8_t> out;
+    size_t bitpos = 0;
+    void putBit(uint32_t b) {
+        size_t byte = bitpos / 8;
+        if (byte >= out.size()) out.push_back(0);
+        if (b) out[byte] |= static_cast<uint8_t>(1u << (7 - (bitpos % 8)));
+        bitpos++;
+    }
+    void putBits(uint32_t v, int n) {
+        for (int i = n - 1; i >= 0; i--) putBit((v >> i) & 1u);
+    }
+    void putUe(uint32_t v) {
+        uint32_t code = v + 1;
+        int nbits = 0;
+        uint32_t t = code;
+        while (t) { nbits++; t >>= 1; }
+        for (int i = 0; i < nbits - 1; i++) putBit(0);
+        putBits(code, nbits);
+    }
+    void copyRawBits(const uint8_t* src, size_t fromBit, size_t toBit) {
+        for (size_t b = fromBit; b < toBit; b++) {
+            size_t byte = b / 8;
+            uint32_t bit = (src[byte] >> (7 - (b % 8))) & 1u;
+            putBit(bit);
+        }
+    }
+};
+
+// 检测并跳过 Annex-B 起始码，返回 NAL 单元起始字节偏移
+size_t SkipStartCode(const uint8_t* data, size_t size) {
+    if (size >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1) return 4;
+    if (size >= 3 && data[0] == 0 && data[1] == 0 && data[2] == 1) return 3;
+    return 0;
+}
+
+// HEVC profile_tier_level(maxSubLayersMinus1) —— 仅解析到所需字段，遇不支持分支即放弃。
+bool ParseHevcProfileTierLevel(BitReader& br, uint32_t maxSubLayersMinus1) {
+    uint32_t v;
+    if (!br.getBits(2, v)) return false;   // profile_space
+    if (!br.getBit(v)) return false;        // tier_flag
+    if (!br.getBits(5, v)) return false;    // profile_idc
+    for (int i = 0; i < 32; i++) if (!br.getBit(v)) return false;  // profile_compatibility_flag[32]
+    if (!br.getBit(v)) return false;        // progressive_source_flag
+    if (!br.getBit(v)) return false;        // interlaced_source_flag
+    if (!br.getBit(v)) return false;        // non_packed_constraint_flag
+    if (!br.getBit(v)) return false;        // frame_only_constraint_flag
+    // 约束标志保留位：根据 profile_idc 选择 43 或 44 位
+    bool isExtended = (v >= 4 && v <= 35) || v == 41 || v == 42 || v == 43 || v == 44 ||
+                      v == 46 || v == 47 || v == 48 || (v >= 50 && v <= 58) ||
+                      v == 60 || v == 61 || v == 62 || v == 63;
+    int reservedBits = isExtended ? 43 : 44;
+    for (int i = 0; i < reservedBits; i++) if (!br.getBit(v)) return false;
+    if (!br.getBits(8, v)) return false;    // general_level_idc
+    uint32_t subLayerProfilePresent[8] = {0};
+    uint32_t subLayerLevelPresent[8] = {0};
+    for (uint32_t i = 0; i < maxSubLayersMinus1; i++) {
+        if (!br.getBit(subLayerProfilePresent[i])) return false;
+        if (!br.getBit(subLayerLevelPresent[i])) return false;
+    }
+    if (maxSubLayersMinus1 > 0) {
+        for (uint32_t i = maxSubLayersMinus1; i < 8; i++)
+            if (!br.getBits(2, v)) return false;  // reserved_zero_2bits
+    }
+    for (uint32_t i = 0; i < maxSubLayersMinus1; i++) {
+        if (subLayerProfilePresent[i]) {
+            if (!br.getBits(2, v)) return false;   // profile_space
+            if (!br.getBit(v)) return false;        // tier_flag
+            if (!br.getBits(5, v)) return false;    // profile_idc
+            for (int j = 0; j < 32; j++) if (!br.getBit(v)) return false;
+            if (!br.getBit(v)) return false;
+            if (!br.getBit(v)) return false;
+            if (!br.getBit(v)) return false;
+            if (!br.getBit(v)) return false;
+            for (int j = 0; j < reservedBits; j++) if (!br.getBit(v)) return false;
+        }
+        if (subLayerLevelPresent[i]) {
+            if (!br.getBits(8, v)) return false;    // sub_layer_level_idc
+        }
+    }
+    return true;
+}
+}  // namespace
+
+bool VideoDecoder::PatchHevcSpsReorder(const uint8_t* srcNal, size_t nalLen, int& outNewLen) const {
+    BitReader br{srcNal, nalLen, 0};
+    uint32_t v;
+    if (!br.getBits(4, v)) return false;            // sps_video_parameter_set_id
+    uint32_t maxSubLayersMinus1;
+    if (!br.getBits(3, maxSubLayersMinus1)) return false;
+    if (!br.getBit(v)) return false;                // sps_temporal_id_nesting_flag
+    if (!ParseHevcProfileTierLevel(br, maxSubLayersMinus1)) return false;
+    if (!br.getUe(v)) return false;                 // sps_seq_parameter_set_id
+    uint32_t chromaFormatIdc;
+    if (!br.getUe(chromaFormatIdc)) return false;   // chroma_format_idc
+    if (chromaFormatIdc == 3) {
+        if (!br.getBit(v)) return false;            // separate_colour_plane_flag
+    }
+    if (!br.getUe(v)) return false;                 // pic_width_in_luma_samples
+    if (!br.getUe(v)) return false;                 // pic_height_in_luma_samples
+    uint32_t confWin;
+    if (!br.getBit(confWin)) return false;
+    if (confWin) {
+        for (int i = 0; i < 4; i++) if (!br.getUe(v)) return false;
+    }
+    if (!br.getUe(v)) return false;                 // bit_depth_luma_minus8
+    if (!br.getUe(v)) return false;                 // bit_depth_chroma_minus8
+    if (!br.getUe(v)) return false;                 // log2_max_pic_order_cnt_lsb_minus4
+    uint32_t subLayerOrdering;
+    if (!br.getBit(subLayerOrdering)) return false; // sps_sub_layer_ordering_info_present_flag
+    uint32_t layers = subLayerOrdering ? (maxSubLayersMinus1 + 1) : 1;
+    if (layers != 1) return false;                  // 多子层位偏移复杂，保守放弃
+    if (!br.getUe(v)) return false;                 // sps_max_dec_pic_buffering_minus1
+    // === 目标字段：sps_max_num_reorder_pics ===
+    size_t posBefore = br.bitpos;
+    uint32_t oldReorder;
+    if (!br.getUe(oldReorder)) return false;
+    size_t posAfter = br.bitpos;
+    if (!br.getUe(v)) return false;                 // sps_max_latency_increase_plus1（丢弃）
+    if (oldReorder == 0) return false;              // 已是 0
+    BitWriter bw;
+    bw.copyRawBits(srcNal, 0, posBefore);
+    bw.putUe(0);
+    bw.copyRawBits(srcNal, posAfter, nalLen * 8);
+    size_t newNalLen = (bw.bitpos + 7) / 8;
+    // 校验：重解析改写后的字段必须为 0，否则放弃（保留原始字节）
+    {
+        BitReader verify{bw.out.data(), newNalLen, 0};
+        verify.bitpos = posBefore;
+        uint32_t chk;
+        if (!verify.getUe(chk) || chk != 0) {
+            OH_LOG_WARN(LOG_APP, "HEVC SPS reorder patch verify failed, skip");
+            return false;
+        }
+    }
+    memcpy(const_cast<uint8_t*>(srcNal), bw.out.data(), newNalLen);
+    outNewLen = static_cast<int>(newNalLen);
+    return true;
+}
+
+bool VideoDecoder::PatchH264SpsReorder(const uint8_t* srcNal, size_t nalLen, int& outNewLen) const {
+    BitReader br{srcNal, nalLen, 0};
+    uint32_t v;
+    if (!br.getBits(8, v)) return false;    // profile_idc
+    if (!br.getBits(8, v)) return false;    // constraint_set flags + reserved
+    if (!br.getBits(8, v)) return false;    // level_idc
+    if (!br.getUe(v)) return false;         // seq_parameter_set_id
+    uint32_t chromaFormatIdc = 1;
+    if (v == 100 || v == 110 || v == 122 || v == 244 || v == 44 || v == 83 ||
+        v == 86 || v == 118 || v == 128 || v == 138 || v == 139 || v == 134 || v == 135) {
+        if (!br.getUe(chromaFormatIdc)) return false;
+        if (chromaFormatIdc == 3) {
+            if (!br.getBit(v)) return false; // separate_colour_plane_flag
+        }
+        if (!br.getUe(v)) return false;      // bit_depth_luma_minus8
+        if (!br.getUe(v)) return false;      // bit_depth_chroma_minus8
+        if (!br.getBit(v)) return false;     // qpprime_y_zero_transform_bypass_flag
+        uint32_t scalingListPresent;
+        if (!br.getBit(scalingListPresent)) return false;
+        if (scalingListPresent) return false; // 缩放列表解析复杂，保守放弃
+    }
+    if (!br.getUe(v)) return false;         // log2_max_frame_num_minus4
+    uint32_t picOrderCntType;
+    if (!br.getUe(picOrderCntType)) return false;
+    if (picOrderCntType == 0) {
+        if (!br.getUe(v)) return false;
+    } else if (picOrderCntType == 1) {
+        if (!br.getBit(v)) return false;
+        int32_t se;
+        if (!br.getSe(se)) return false;
+        if (!br.getSe(se)) return false;
+        uint32_t numRefFrames;
+        if (!br.getUe(numRefFrames)) return false;
+        for (uint32_t i = 0; i < numRefFrames; i++) if (!br.getSe(se)) return false;
+    }
+    if (!br.getUe(v)) return false;         // max_num_ref_frames
+    if (!br.getBit(v)) return false;        // gaps_in_frame_num_value_allowed_flag
+    if (!br.getUe(v)) return false;         // pic_width_in_mbs_minus1
+    if (!br.getUe(v)) return false;         // pic_height_in_mbs_minus1
+    uint32_t frameMbsOnly;
+    if (!br.getBit(frameMbsOnly)) return false;
+    if (!frameMbsOnly) {
+        if (!br.getBit(v)) return false;    // mb_adaptive_frame_field_flag
+    }
+    if (!br.getBit(v)) return false;        // direct_8x8_inference_flag
+    uint32_t frameCropping;
+    if (!br.getBit(frameCropping)) return false;
+    if (frameCropping) {
+        if (!br.getUe(v)) return false;
+        if (!br.getUe(v)) return false;
+        if (!br.getUe(v)) return false;
+        if (!br.getUe(v)) return false;
+    }
+    uint32_t vuiPresent;
+    if (!br.getBit(vuiPresent)) return false;
+    if (!vuiPresent) return false;          // 无 VUI，无需改写
+    if (!br.getBit(v)) return false;        // aspect_ratio_info_present_flag
+    if (v) {
+        uint32_t aspectRatioIdc;
+        if (!br.getBits(8, aspectRatioIdc)) return false;
+        if (aspectRatioIdc == 255) {
+            if (!br.getBits(16, v)) return false;
+            if (!br.getBits(16, v)) return false;
+        }
+    }
+    if (!br.getBit(v)) return false;        // overscan_info_present_flag
+    if (v) { if (!br.getBit(v)) return false; }
+    if (!br.getBit(v)) return false;        // video_signal_type_present_flag
+    if (v) {
+        if (!br.getBits(3, v)) return false;
+        if (!br.getBit(v)) return false;
+        if (!br.getBit(v)) return false;
+        if (v) {
+            if (!br.getBits(8, v)) return false;
+            if (!br.getBits(8, v)) return false;
+            if (!br.getBits(8, v)) return false;
+        }
+    }
+    if (!br.getBit(v)) return false;        // chroma_loc_info_present_flag
+    if (v) { if (!br.getUe(v)) return false; if (!br.getUe(v)) return false; }
+    if (!br.getBit(v)) return false;        // timing_info_present_flag
+    if (v) {
+        if (!br.getBits(32, v)) return false;
+        if (!br.getBits(32, v)) return false;
+        if (!br.getBit(v)) return false;
+    }
+    uint32_t nalHrd, vclHrd;
+    if (!br.getBit(nalHrd)) return false;
+    if (nalHrd) return false;               // hrd_parameters 复杂，保守放弃
+    if (!br.getBit(vclHrd)) return false;
+    if (vclHrd) return false;
+    if (!br.getBit(v)) return false;        // pic_struct_present_flag
+    if (!br.getBit(v)) return false;        // bitstream_restriction_flag
+    if (!v) return false;                   // 无 bitstream_restriction，无需改写
+    if (!br.getBit(v)) return false;        // motion_vectors_over_pic_boundaries_flag
+    if (!br.getUe(v)) return false;         // max_bytes_per_pic_denom
+    if (!br.getUe(v)) return false;         // max_bits_per_mb_denom
+    if (!br.getUe(v)) return false;         // log2_max_mv_length_horizontal
+    if (!br.getUe(v)) return false;         // log2_max_mv_length_vertical
+    // === 目标字段：max_num_reorder_frames ===
+    size_t posBefore = br.bitpos;
+    uint32_t oldReorder;
+    if (!br.getUe(oldReorder)) return false;
+    size_t posAfter = br.bitpos;
+    if (!br.getUe(v)) return false;         // max_dec_frame_buffering（丢弃）
+    if (oldReorder == 0) return false;
+    BitWriter bw;
+    bw.copyRawBits(srcNal, 0, posBefore);
+    bw.putUe(0);
+    bw.copyRawBits(srcNal, posAfter, nalLen * 8);
+    size_t newNalLen = (bw.bitpos + 7) / 8;
+    {
+        BitReader verify{bw.out.data(), newNalLen, 0};
+        verify.bitpos = posBefore;
+        uint32_t chk;
+        if (!verify.getUe(chk) || chk != 0) {
+            OH_LOG_WARN(LOG_APP, "H.264 SPS reorder patch verify failed, skip");
+            return false;
+        }
+    }
+    memcpy(const_cast<uint8_t*>(srcNal), bw.out.data(), newNalLen);
+    outNewLen = static_cast<int>(newNalLen);
+    return true;
+}
+
+bool VideoDecoder::PatchSpsReorder(uint8_t* data, int& length, VideoCodecType codec) const {
+    if (codec == VideoCodecType::AV1) return false;  // AV1 无 SPS 概念
+    const size_t size = static_cast<size_t>(length);
+    size_t nalStart = SkipStartCode(data, size);
+    if (nalStart + 1 > size) return false;
+    const uint8_t* srcNal = data + nalStart;
+    size_t nalLen = size - nalStart;
+
+    BitReader br{srcNal, nalLen, 0};
+    uint32_t nalType = 0;
+    if (codec == VideoCodecType::HEVC) {
+        uint32_t f, t, l, tid;
+        if (!br.getBit(f)) return false;
+        if (!br.getBits(6, t)) return false;
+        if (!br.getBits(3, l)) return false;
+        if (!br.getBits(3, tid)) return false;
+        nalType = t;
+        if (nalType != 33) return false;    // 非 HEVC SPS
+    } else {                                 // H264
+        uint32_t f, t, nri;
+        if (!br.getBit(f)) return false;
+        if (!br.getBits(5, t)) return false;
+        if (!br.getBits(2, nri)) return false;
+        nalType = t;
+        if (nalType != 7) return false;     // 非 H.264 SPS
+    }
+
+    int newNalLen = 0;
+    bool changed = false;
+    if (codec == VideoCodecType::HEVC) {
+        changed = PatchHevcSpsReorder(srcNal, nalLen, newNalLen);
+    } else {
+        changed = PatchH264SpsReorder(srcNal, nalLen, newNalLen);
+    }
+    if (changed) {
+        length = static_cast<int>(nalStart + newNalLen);
+    }
+    return changed;
+}
+
+bool VideoDecoder::BuildPatchedBitstream(const BufferSegment* segments, int segmentCount, int totalSize,
+                                         VideoCodecType codec, std::vector<uint8_t>& out, int& outLen) {
+    out.clear();
+    out.reserve(totalSize);
+    bool anyPatched = false;
+    for (int i = 0; i < segmentCount; i++) {
+        const BufferSegment& seg = segments[i];
+        if (seg.data == nullptr || seg.length <= 0) continue;
+        std::vector<uint8_t> tmp(seg.data, seg.data + seg.length);
+        int newLen = seg.length;
+        if (PatchSpsReorder(tmp.data(), newLen, codec)) {
+            anyPatched = true;
+            OH_LOG_INFO(LOG_APP, "SPS reorder patch applied to segment %{public}d (%{public}d -> %{public}d bytes)",
+                        i, seg.length, newLen);
+        }
+        out.insert(out.end(), tmp.data(), tmp.data() + newLen);
+    }
+    outLen = static_cast<int>(out.size());
+    return anyPatched;
 }
 
 // =============================================================================
@@ -2351,8 +2899,10 @@ int VideoDecoder::SyncProcessOutput(int64_t timeoutUs) {
     
     // Step 2 consumes only the newest decoded frame and looks up the target
     // prepared before decode. Drained targets are removed above.
-    SubmitDecodedFrame(decoder_, latestIndex, latestAttr,
-                       enqueueTimeMs, outputTimeMs);
+    // 低延迟优化 #1（DiPlay 模式）：送显动作移交给专用送显线程，避免在同步解码线程上
+    // 执行 GL 后处理 + 呈现调度，从而把解码线程让给下一帧的输入/输出轮询。
+    EnqueueOutput(decoder_, latestIndex, latestAttr,
+                  enqueueTimeMs, outputTimeMs);
 
     return 1;  // 成功渲染一帧
 }
@@ -2609,6 +3159,9 @@ int Start() {
     config.bufferCount = g_bufferCount;
     config.decoderMode = g_syncMode ? DecoderMode::SYNC : DecoderMode::ASYNC;
     config.enableVrr = g_enableVrr;
+    // 低延迟优化开关（详见 VideoDecoderConfig 注释）
+    config.reportTrueFps = true;            // 帧率上报收敛：上报真实 FPS（降低覆盖层解码延迟显示失真）
+    config.enableSpsReorderPatch = false;   // SPS 无重排修补：实验特性，默认关闭（服务端关闭 B 帧才是根本解法）
     
     // 颜色空间
     switch (g_colorSpace) {

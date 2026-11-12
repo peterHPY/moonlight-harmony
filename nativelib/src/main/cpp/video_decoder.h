@@ -128,6 +128,13 @@ struct VideoDecoderConfig {
     bool enableVrr;       // VRR (Variable Refresh Rate) 可变刷新率模式
                           // 启用后解码器输出将适配可变刷新率显示
                           // 注意：VRR 可能会丢帧以匹配屏幕刷新率，主要用于节能
+
+    // === 低延迟优化开关 ===
+    bool reportTrueFps = true;          // 帧率上报收敛：true=上报真实 FPS（默认，使覆盖层解码延迟显示更贴近真实值）；
+                                        // false=沿用旧策略（以 2x 实际帧率上报，防止部分设备 VPU 在静态画面降频）
+    bool enableSpsReorderPatch = false; // SPS/VUI 无重排修补（实验特性，默认关闭）：
+                                        // 客户端强制清零 max_num_reorder_pics(HEVC)/max_num_reorder_frames(H.264)。
+                                        // 注意：真正去除 B 帧重排需服务端关闭 B 帧 + 使用 closed GOP，此修补仅为辅助手段。
 };
 
 /**
@@ -332,6 +339,24 @@ private:
                             const OH_AVCodecBufferAttr& attr,
                             int64_t enqueueTimeMs, int64_t outputTimeMs);
 
+    // 专用送显线程：消费 outputQueue_，在独立线程调用 SubmitDecodedFrame
+    void OutputThreadLoop();
+    // 由解码回调线程 / 同步解码线程调用：将一帧送入送显队列
+    void EnqueueOutput(OH_AVCodec* codec, uint32_t index,
+                       const OH_AVCodecBufferAttr& attr,
+                       int64_t enqueueTimeMs, int64_t outputTimeMs);
+
+    // === 低延迟优化 #2：SPS/VUI 无重排修补（实验特性） ===
+    // 将分段码流重组为连续缓冲，必要时对每个分段的 SPS NAL 应用无重排修补。
+    // 返回 true 表示产生了修补后的缓冲（out/outLen 有效）；false 表示沿用原始分段。
+    bool BuildPatchedBitstream(const BufferSegment* segments, int segmentCount, int totalSize,
+                               VideoCodecType codec, std::vector<uint8_t>& out, int& outLen);
+    // 在单段 Annex-B NAL 缓冲内就地清零重排字段（HEVC sps_max_num_reorder_pics /
+    // H.264 max_num_reorder_frames）。返回 true 表示已改写（length 更新为改写后长度）。
+    bool PatchSpsReorder(uint8_t* data, int& length, VideoCodecType codec) const;
+    bool PatchHevcSpsReorder(const uint8_t* srcNal, size_t nalLen, int& outNewLen) const;
+    bool PatchH264SpsReorder(const uint8_t* srcNal, size_t nalLen, int& outNewLen) const;
+
     void RecordDroppedFrames(DropReason reason, uint64_t count = 1);
     
     // 延迟恢复：检查是否应丢弃输入帧并请求 IDR
@@ -389,6 +414,23 @@ private:
     // 同步模式解码线程
     std::thread syncDecodeThread_;
     std::atomic<bool> syncDecodeRunning_{false};
+
+    // === 低延迟优化 #1：专用送显线程 (DiPlay 模式) ===
+    // 将 render_->SubmitFrame（GL 后处理 + 呈现调度）从解码回调线程 / 同步解码线程中
+    // 解耦出来，避免后处理阻塞解码器输出 buffer 回收，从而降低解码器侧拥塞与延迟抖动。
+    struct OutputTask {
+        OH_AVCodec* codec = nullptr;
+        uint32_t index = 0;
+        OH_AVCodecBufferAttr attr{};
+        int64_t enqueueTimeMs = 0;
+        int64_t outputTimeMs = 0;
+    };
+    std::thread outputThread_;
+    std::atomic<bool> outputRunning_{false};
+    std::mutex outputMutex_;
+    std::condition_variable outputCond_;
+    std::queue<OutputTask> outputQueue_;
+    size_t maxOutputQueue_{4};  // 背压上限：超出则丢弃最旧待送显帧
     
     // Fixed-size timestamp ring avoids a node allocation/free for every frame.
     struct TimestampEntry {
