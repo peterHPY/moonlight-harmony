@@ -208,6 +208,39 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
+### Rumblebridge
+
+- **项目**: Rumblebridge
+- **GitHub**: https://github.com/Mokomis/rumblebridge
+- **许可证**: MIT License
+- **说明**: 雷蛇骑仕（Kishi V3 Pro，Sensa HD 触感）USB HID 触感流协议的逆向参考实现。
+  `RazerKishiHaptics.ets` 中的触感帧编码（output report 2 / command 0x0E 位流格式、
+  频率索引校准与空闲休眠行为）基于该项目 daemon/rumblebridged.c 的逆向成果移植。
+
+```
+MIT License
+
+Copyright (c) 2026 Mokomis
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ---
 
 ## 许可证清单

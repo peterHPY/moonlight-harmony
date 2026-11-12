@@ -88,6 +88,14 @@
       "desc": "HarmonyOS 单元测试框架",
       "url": "ohpm.openharmony.cn/#/cn/detail/@ohos%2Fhypium",
       "showInAbout": false
+    },
+    {
+      "name": "Rumblebridge",
+      "license": "MIT",
+      "licenseType": "Permissive",
+      "desc": "雷蛇骑仕 Sensa HD 触感 HID 协议逆向参考实现",
+      "url": "github.com/Mokomis/rumblebridge",
+      "showInAbout": true
     }
   ]
 }
