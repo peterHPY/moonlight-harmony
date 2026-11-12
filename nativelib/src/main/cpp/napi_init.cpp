@@ -29,6 +29,8 @@
 #include "usb_helper.h"
 #include "usb_ddk_poller.h"
 #include "usbip_napi.h"
+// v71: denise_encoder_napi.h（Razer Interhaptics 私有编码器适配层）已整体删除，
+// 对应的 deniseShutdown 导出也一并移除。
 // SDL3 库尚未移植到 HarmonyOS，暂时禁用
 // #include "sdl3/sdl3_gamepad_napi.h"
 
@@ -152,7 +154,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         
         // 音频振动
         { "setAudioHapticsConfig", nullptr, MoonBridge_SetAudioHapticsConfig, nullptr, nullptr, nullptr, napi_default, nullptr },
-        
+
         // XComponent 帧率设置（通过 FrameNode → ArkUI_NodeHandle，无需 libraryname）
         { "setXComponentFrameRate", nullptr, MoonBridge_SetXComponentFrameRate, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setFrameRateKeepAlive", nullptr, MoonBridge_SetFrameRateKeepAlive, nullptr, nullptr, nullptr, napi_default, nullptr },

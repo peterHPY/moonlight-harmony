@@ -174,6 +174,19 @@ add_library(moonlight_nativelib SHARED
 )
 add_dependencies(moonlight_nativelib generate_shader_header)
 
+# ---- v34 实验版：Razer Interhaptics 官方编码器（v71 起代码与库全部删除）-----
+# ⚠️ 合规说明（2026-11-12 审计）：
+#   libwin_codec.so 是从**商业 APK**（PeaSyo Android 2.1.0）里提取的
+#   Razer Interhaptics HapticEncoder 私有实现（RzInterhaptics::HapticEncoder）。
+#   没有任何可再分发授权，随 HAP 分发属于侵权。
+#   v70 从打包路径移除；v71 把适配层（denise_encoder_napi.cpp/.h）、
+#   NAPI 导出和 callbacks.cpp 里的调用点也全部删除，二进制里不再有那段代码
+#   与 dlsym 符号。配套的 libbs.so（bionic_stub.c）只为那个 Android ELF
+#   服务，无编码器即无用途，也一并删除（别再加回来）。
+#   私有库副本仍在工程外：reverse/denise-prebuilt/arm64-v8a/，仅供私下研究，
+#   **不得**复制回本工程任何会参与打包的目录。
+# ---------------------------------------------------------------------------
+
 # nanors 需要优化标志以获得最佳 Reed-Solomon 性能
 # 使用 ohos_shim/assert.h 避免 OHOS assert.h 的 __assert_fail 与 Clang target
 # multiversioning 冲突 (尤其是 x86_64 模拟器构建)

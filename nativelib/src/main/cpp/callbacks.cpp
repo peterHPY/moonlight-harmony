@@ -40,6 +40,7 @@ extern void MicCapturerUpdatePacketLossPercent(int percent);
 #include <sched.h>
 #include <unistd.h>
 #include <fstream>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -168,6 +169,209 @@ struct AudioHapticCallbackData {
 struct Ds5HapticsIrFrameData {
     LI_DS5_HAPTICS_IR_FRAME_V2 frame{};
 };
+
+// ---------------------------------------------------------------------------
+// Host-authored DualSense tactile PCM.
+//
+// Sunshine exposes the virtual DualSense USB audio endpoint as a 48 kHz
+// stereo 16-bit control-stream packet. The client used to advertise only the
+// simulated-DualSense capability, so the host analysed this waveform on the
+// PC and shipped five lossy scalars (IR v2) instead. We now accept the raw
+// waveform, measure its real envelope / band split / transients locally, and
+// hand a compact 20 ms description to ArkTS. Keeping the DSP here avoids
+// copying ~20 kB/s of PCM across NAPI on the control receive thread.
+// ---------------------------------------------------------------------------
+struct Ds5PcmFrameData {
+    uint8_t flags = 0;
+    uint16_t controllerNumber = 0;
+    uint32_t frameCount = 0;
+    double presentationTimeUs = 0;
+    double leftRms = 0;
+    double rightRms = 0;
+    double leftLowRatio = 0;
+    double rightLowRatio = 0;
+    double attack = 0;
+    double texture = 0;
+    // v20: 4 子带频谱权重（0..1，按各子带能量归一化），驱动协议 4 谐波分量。
+    double bandAmp[4] = {0.0, 0.0, 0.0, 0.0};
+    uint8_t silent = 0;
+};
+
+static constexpr uint32_t PCM_WINDOW_FRAMES = 960;  // 20 ms at 48 kHz
+static constexpr float PCM_LOWPASS_ALPHA = 0.021f;  // ~160 Hz tactile split
+static constexpr float PCM_INPUT_GAIN = 6.0;        // authored PCM is usually low level
+// v19: v18 实测纹理段被压在 L=2~8（几乎无感）、静默段持续 L=1（微嗡底噪），
+// 导致"不清晰干脆"。两处修正：
+//  1) 噪声门：原始频段 RMS < PCM_DEADZONE_RAW 视为真静音 -> 输出 0，
+//     消除持续底噪，恢复干净静音（实测 raw≈0.003 的静默段直接归零）。
+//  2) 感知扩展：pow(g, PCM_GAMMA)（GAMMA<1）非线性抬升中低档纹理，
+//     原 L=2~8 提升到 L≈10~17，彼此仍可分档；强档(>1)经软膝收敛到 ≤1。
+static constexpr float PCM_KNEE = 0.95f;            // v21: 软膝上限略升，给强档撞击留更多动态头
+static constexpr float PCM_GAMMA = 0.6f;            // 感知扩展指数（<1 抬升低档）
+static constexpr float PCM_DEADZONE_RAW = 0.004f;   // v21: 噪声门下调，让细碎雨滴(低幅瞬态)能存活
+static constexpr float PCM_MIN_ENVELOPE = 0.0005f;
+static constexpr float PCM_CRISP_GAIN = 0.9f;       // v22: 高频带上升沿额外加力（更强），恢复雨滴/铃铛的干脆感
+
+// ===== v61: 相对基线跃升（energy jump）瞬态增强 =====
+// v60 用「峰均比 crest」判瞬态，**实测失败**（20:43 日志）：
+//   雨滴帧 crest=3.46/4.32、3.84/3.32，比落地还高 ⇒ boost=1.00 全部命中雨滴，
+//   把 bandLow 仅 0.012 的弱雨滴直接抬到 outLow=1.0000（满档）。
+//   ⇒ 雨滴变成持续满档震动，反而**掩蔽**了落地，用户「雨滴盖过落地」。
+// 根因：DS5 触觉音轨上的雨滴本身就是**一串离散脉冲**，峰均比天然高（3~4）。
+//   crest 区分不了"雨滴脉冲"与"落地冲击"，二者形态同类，只有**能量量级**不同。
+// 解法：改用「本窗口频带能量 / 慢速基线」的比值 jump。
+//   雨滴 bandLow 实测 0.002~0.03，基线跟随在同一量级 ⇒ jump≈1~2 ⇒ boost=0；
+//   落地 bandLow 冲到 0.13~0.35，基线仍在 0.015 ⇒ jump≈10~20 ⇒ boost 满。
+//   ⇒ 只抬高真正的冲击，雨滴保持 v59 已被用户认可的细腻度（"雨滴没问题"）。
+static constexpr double PCM_JUMP_KNEE = 3.0;     // 加成起点（保持 v61/v62 的强度曲线）
+// v65: 死区 —— jump 未超过此值时**完全不给加成**。
+// 为什么不能靠提高 KNEE 来挡雨滴：v64 把 KNEE 提到 4.0，日志实测
+//   jump=4.31 → boost 0.26(v61) 变 0.06(v64)，jump=3.98 → 0.20 变 0，
+//   而 jump 4~8 正是**普通跳跃落地**的量级 ⇒ 整段被砍 ⇒ 用户「不如 v61」。
+// 正确做法：强度曲线维持 v61（KNEE=3.0），另设死区 4.5 —— 雨滴实测最大 3.34，
+// 落在死区内拿不到任何加成；中等落地（≥4.5）仍按 v61 曲线给力。
+static constexpr double PCM_JUMP_DEADZONE = 4.5;
+static constexpr double PCM_JUMP_SCALE = 0.2;    // (jump - KNEE) * SCALE，jump=8 → 1.0 满加成
+static constexpr double PCM_TRANSIENT_BOOST = 0.85;  // 瞬态额外叠加到整形后包络（0~1 域）
+// v62: 冲击帧 4 子带的保底权重。设备同时合成 4 个 (幅度,频点) 分量，
+// 实际输出能量 ∝ ΣbandAmp；落地实测只有 1.46（几乎全在一个频点），
+// 雨滴 1.49 —— 二者总驱动相同，这正是"落地幅度满了却不重"的量化原因。
+// 抬底到 0.55 后落地 Σ≈0.55*3+1.0=2.65（+81%），且只有冲击帧生效。
+// v65: 回到 v62 的 **0.55 全频抬底**（用户实测「好了一点」，是已验证有效的力度）。
+// v63 的 0.90 全抬 → 变成宽频"糊"、低频重心被稀释，「还不如上一版」；已放弃。
+// v64 的 0.85/0.30 分频本身没坏，但那版同时把 KNEE 提到 4.0 砍掉了中等落地，
+// 无法单独判断。现在先固定回已验证的 0.55，变量单一。
+static constexpr double PCM_IMPACT_BAND_FLOOR = 0.55;      // 低频~中频（k=0/1/2）
+static constexpr double PCM_IMPACT_BAND_FLOOR_HIGH = 0.55;  // 高频（k=3）
+static constexpr double PCM_BASE_RISE = 0.010;   // 基线上升系数（慢，≈2s 时间常数，不被单次冲击带偏）
+static constexpr double PCM_BASE_FALL = 0.050;   // 基线下降系数（稍快，≈0.4s 跟上雨滴变弱）
+
+// 慢速基线跟踪：只用于判断"本帧能量是否远高于近期常态"，不参与输出。
+static inline void pcmUpdateBaseline(double &base, double band) {
+    const double a = (band > base) ? PCM_BASE_RISE : PCM_BASE_FALL;
+    base += (band - base) * a;
+    if (base < static_cast<double>(PCM_DEADZONE_RAW)) {
+        base = static_cast<double>(PCM_DEADZONE_RAW);  // 下限=噪声门，避免除零后 jump 虚高
+    }
+}
+
+// 噪声门 + 6x 增益 + 感知扩展 + 0.92 软膝上限。
+// 弱档被非线性抬升（纹理可感、分档清晰），强档平滑饱和到 1.0 但保持排序。
+static inline double pcmShape(double raw) {
+    if (raw <= static_cast<double>(PCM_DEADZONE_RAW)) {
+        return 0.0;  // 噪声门：彻底静音，不再有持续微嗡
+    }
+    const double g = raw * static_cast<double>(PCM_INPUT_GAIN);
+    const double e = std::pow(g, static_cast<double>(PCM_GAMMA));
+    if (e <= static_cast<double>(PCM_KNEE)) {
+        return e;
+    }
+    const double span = 1.0 - static_cast<double>(PCM_KNEE);
+    return static_cast<double>(PCM_KNEE) +
+        span * (1.0 - std::exp(-(e - PCM_KNEE) / span));
+}
+
+// v20: 4 子带 Goertzel，把 DS5 波形的真实频谱形状映射到协议的 4 谐波分量。
+// 雷蛇 WYVRN 协议的频率是 0-127 索引，索引->Hz 官方未公开；这里在真实 Hz 域
+// (48kHz) 做 Goertzel 取频谱形状，用经验映射填索引。关键在于「相对频谱形状」
+// （哪个频带有能量）如实进入手柄合成 —— 沙地的高频分量、引擎的低频分量因此
+// 能被区分，材质颗粒感即来自此。索引->Hz 的具体标定交 ArkTS 的 PCM_SPECTRAL_*。
+static constexpr int PCM_BANDS = 4;
+static constexpr float PCM_BAND_HZ[PCM_BANDS] = {50.0f, 180.0f, 550.0f, 1300.0f};
+// v22: 频率响应预加重——马达是谐振型执行器，高频段滚降明显。
+// 这里按"逆频率响应"提升各子带幅度（越高频提越多），让"脆"段即便在弱响应区也能被手感觉到。
+// 数值来自 rumblebridge 对雷蛇马达的实测（低频~59/132Hz 最猛、高频骤降）的经验逆曲线。
+static constexpr float PCM_BAND_PREEMP[PCM_BANDS] = {1.0f, 1.3f, 1.7f, 2.2f};
+static float g_bandCoeff[PCM_BANDS] = {0.0f, 0.0f, 0.0f, 0.0f};
+static bool g_bandInit = false;
+static double g_pcmLastBandAmp[4] = {0.0, 0.0, 0.0, 0.0};
+static void initBandCoeff() {
+    if (g_bandInit) return;
+    static const double kPi = 3.14159265358979323846;
+    for (int k = 0; k < PCM_BANDS; ++k) {
+        g_bandCoeff[k] = static_cast<float>(
+            2.0 * std::cos(2.0 * kPi * static_cast<double>(PCM_BAND_HZ[k]) / 48000.0));
+    }
+    g_bandInit = true;
+}
+
+struct PcmAccumulator {
+    uint32_t frames = 0;
+    uint64_t presentationTimeUs = 0;
+    double sumSq[2] = {0.0, 0.0};
+    double lowSq[2] = {0.0, 0.0};
+    double highSq[2] = {0.0, 0.0};
+    uint32_t crossings[2] = {0, 0};
+    // v60: 窗口内低/高频带的瞬时峰值（绝对值），用于计算峰均比（crest factor）。
+    // 为什么必须有：RMS 会严重低估短瞬态 —— 落地冲击只占窗口 5~20% 时长，
+    // RMS 只有真实峰值的 0.22~0.45 倍，实测导致「10 次跳落地丢 5 次」
+    // （landing 时 bandLow 时高时低：0.35 → L=63；0.05 → L=30，与雨滴无法区分）。
+    float lowPeak[2] = {0.0f, 0.0f};
+    float highPeak[2] = {0.0f, 0.0f};
+    float lowpass[2] = {0.0f, 0.0f};
+    float previous[2] = {0.0f, 0.0f};
+    // v20: Goertzel 滑动状态（跨窗口连续，避免每帧 DC 阶跃误判为低频瞬态）。
+    double gPrev[2][PCM_BANDS] = {{0.0, 0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 0.0}};
+    double gPrev2[2][PCM_BANDS] = {{0.0, 0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 0.0}};
+    double gPow[2][PCM_BANDS] = {{0.0, 0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 0.0}};
+
+    // Only the per-window accumulators are cleared. The IIR state must survive
+    // the window boundary, otherwise every 20 ms frame starts with a DC step
+    // that the band split would report as a false low-frequency transient.
+    void reset() {
+        frames = 0;
+        for (int c = 0; c < 2; ++c) {
+            sumSq[c] = lowSq[c] = highSq[c] = 0.0;
+            lowPeak[c] = highPeak[c] = 0.0f;
+            crossings[c] = 0;
+        }
+    }
+};
+
+static PcmAccumulator g_pcmAccum;
+static float g_pcmPrevRms[2] = {0.0f, 0.0f};
+static bool g_pcmHasHistory = false;
+static uint32_t g_pcmPacketCount = 0;
+static uint32_t g_pcmFrameCount = 0;
+// v67: 格式不符被丢弃的包数。此前该分支静默 return，hilog 里什么都看不到，
+// 是「PCM 明明在发却没触感」这类问题的排查盲区。现在限流告警。
+static uint32_t g_pcmFormatReject = 0;
+// v18 遥测：每 ~1s 输出一次未整形 RMS 分布（peak/mean）与最近一帧的
+// 频段 lane 值，为下一轮数据驱动的增益标定提供真实依据。
+static double g_pcmRawPeak = 0.0;
+static double g_pcmRawSum = 0.0;
+static uint32_t g_pcmRawN = 0;
+static double g_pcmLastBandLow = 0.0;
+static double g_pcmLastBandHigh = 0.0;
+// v19 遥测：最近一帧整形后的输出（噪声门+扩展+软膝之后），用于核对
+// 噪声门是否真正归零、纹理档是否被抬升到可感区间。
+static double g_pcmLastOutLow = 0.0;
+static double g_pcmLastOutHigh = 0.0;
+// v61: 慢速基线（用于 jump 比值判据），跟着雨滴常态走，不被单次冲击带偏。
+static double g_pcmLowBaseline = 0.004;
+static double g_pcmHighBaseline = 0.004;
+// v62: 本帧 4 子带抬底值（0 = 非冲击帧，未抬底），用于验证落地是否真的铺开能量。
+static double g_pcmLastImpactFloor = 0.0;
+// v63: 本帧轻马达抑制后的保留比例（1.00 = 未压，冲击帧应 <1）。
+static double g_pcmLastFloorHigh = 0.0;
+// v60 遥测：最近一帧的峰均比与瞬态加成，用于确认「冲击帧 boost>0、雨滴帧 boost=0」
+static double g_pcmLastCrestLow = 0.0;
+static double g_pcmLastCrestHigh = 0.0;
+static double g_pcmLastBoostLow = 0.0;
+static double g_pcmLastBoostHigh = 0.0;
+
+// v71: v23 的 raw PCM 直灌路径（55 AA 帧格式）已**整体删除**。
+// 该协议是从 Android 开源版 PeaSyo 抄错的，v23~v30 全部静音；
+// 且它会往同一条 TSFN 管道里塞 55AA 帧污染队列。连带删除的常量：
+// RAZER_RAW_OUT_RATE / RAZER_RAW_IN_RATE / RAZER_RAW_SAMPLES_PER_FRAME /
+// RAZER_RAW_FRAME_BYTES / g_rawOutPending。**不要再加回来。**
+// 与 ArkTS 侧对应的 RazerKishiRawHaptics（RAW_PCM_ENABLED=false）同为死路径。
+
+static void CallJs_Ds5HapticsPcm(napi_env env, napi_value js_callback,
+                                 void* context, void* data);
+static void PublishDs5PcmFrame(const Ds5PcmFrameData& frame);
+static void CallJs_RazerRawHaptic(napi_env env, napi_value js_callback,
+                                  void* context, void* data);
 
 struct AdaptiveTriggerCallbackData {
     uint16_t controllerNumber = 0;
@@ -829,7 +1033,13 @@ void Callbacks_Init(napi_env env, napi_value callbacks) {
     g_adaptiveTriggerQueue.clear();
     g_adaptiveTriggerPumpQueued = false;
     g_ds5IrShuttingDown = false;
-    
+    g_pcmAccum.reset();
+    g_pcmHasHistory = false;
+    g_pcmPrevRms[0] = 0.0f;
+    g_pcmPrevRms[1] = 0.0f;
+    g_pcmPacketCount = 0;
+    g_pcmFrameCount = 0;
+
     napi_value callback;
     
     // 视频解码器回调
@@ -897,6 +1107,18 @@ void Callbacks_Init(napi_env env, napi_value callbacks) {
                                  &g_connCallbacks.tsfn_ds5HapticsIrV2,
                                  1);
     }
+    if (napi_get_named_property(env, callbacks, "ds5HapticsPcm", &callback) == napi_ok) {
+        CreateThreadsafeFunction(env, callback, "ds5HapticsPcm",
+                                 CallJs_Ds5HapticsPcm,
+                                 &g_connCallbacks.tsfn_ds5HapticsPcm,
+                                 4);
+    }
+    if (napi_get_named_property(env, callbacks, "razerRawHaptic", &callback) == napi_ok) {
+        CreateThreadsafeFunction(env, callback, "razerRawHaptic",
+                                 CallJs_RazerRawHaptic,
+                                 &g_connCallbacks.tsfn_razerRawHaptic,
+                                 16);
+    }
     if (napi_get_named_property(env, callbacks, "connectionStatusUpdate", &callback) == napi_ok) {
         CreateThreadsafeFunction(env, callback, "connectionStatusUpdate", CallJs_ConnectionStatusUpdate, &g_connCallbacks.tsfn_connectionStatusUpdate);
     }
@@ -960,6 +1182,8 @@ void Callbacks_Cleanup(void) {
     if (g_connCallbacks.tsfn_connectionTerminated) napi_release_threadsafe_function(g_connCallbacks.tsfn_connectionTerminated, napi_tsfn_release);
     if (g_connCallbacks.tsfn_rumble) napi_release_threadsafe_function(g_connCallbacks.tsfn_rumble, napi_tsfn_release);
     if (g_connCallbacks.tsfn_ds5HapticsIrV2) napi_release_threadsafe_function(g_connCallbacks.tsfn_ds5HapticsIrV2, napi_tsfn_release);
+    if (g_connCallbacks.tsfn_ds5HapticsPcm) napi_release_threadsafe_function(g_connCallbacks.tsfn_ds5HapticsPcm, napi_tsfn_release);
+    if (g_connCallbacks.tsfn_razerRawHaptic) napi_release_threadsafe_function(g_connCallbacks.tsfn_razerRawHaptic, napi_tsfn_release);
     if (g_connCallbacks.tsfn_connectionStatusUpdate) napi_release_threadsafe_function(g_connCallbacks.tsfn_connectionStatusUpdate, napi_tsfn_release);
     if (g_connCallbacks.tsfn_setHdrMode) napi_release_threadsafe_function(g_connCallbacks.tsfn_setHdrMode, napi_tsfn_release);
     if (g_connCallbacks.tsfn_setMotionEventState) napi_release_threadsafe_function(g_connCallbacks.tsfn_setMotionEventState, napi_tsfn_release);
@@ -1439,6 +1663,10 @@ void BridgeArDecodeAndPlaySample(char* sampleData, int sampleLength) {
         }
     }
 
+    // v35 修正：官方编码器【不再】喂游戏声。触觉源改为「主机下发的 DS5 触觉 PCM」，
+    // 在 BridgeClDs5HapticsPcm() 中喂入编码器（见该函数内）。此处只保留解码与
+    // 0x0E 保底合成（0x0E 在编码器活跃时自动让路）。
+
     if ((s_arvFrameSeq % kFramesPerLog) == 0 && s_arvSampleCount > 0) {
         const int satPct = (int)(s_arvSatSum * 100 / s_arvSampleCount);
         const int meanAbs = (int)(s_arvAbsSum / s_arvSampleCount);
@@ -1532,6 +1760,344 @@ void BridgeClRumble(unsigned short controllerNumber, unsigned short lowFreqMotor
         napi_status st = napi_call_threadsafe_function(g_connCallbacks.tsfn_rumble, data, napi_tsfn_nonblocking);
         if (st != napi_ok) delete data;
     }
+}
+
+static void CallJs_Ds5HapticsPcm(napi_env env, napi_value js_callback,
+                                 void* context, void* data) {
+    (void)context;
+    Ds5PcmFrameData* frame = static_cast<Ds5PcmFrameData*>(data);
+    if (frame == nullptr) return;
+    if (env != nullptr && js_callback != nullptr) {
+        napi_value object;
+        if (napi_create_object(env, &object) == napi_ok) {
+            SetObjectUint32(env, object, "flags", frame->flags);
+            SetObjectUint32(env, object, "controllerNumber", frame->controllerNumber);
+            SetObjectUint32(env, object, "frameCount", frame->frameCount);
+            SetObjectUint32(env, object, "silent", frame->silent);
+            SetObjectDouble(env, object, "presentationTimeUs", frame->presentationTimeUs);
+            SetObjectDouble(env, object, "leftRms", frame->leftRms);
+            SetObjectDouble(env, object, "rightRms", frame->rightRms);
+            SetObjectDouble(env, object, "leftLowRatio", frame->leftLowRatio);
+            SetObjectDouble(env, object, "rightLowRatio", frame->rightLowRatio);
+            SetObjectDouble(env, object, "attack", frame->attack);
+            SetObjectDouble(env, object, "texture", frame->texture);
+            napi_value bandArr;
+            if (napi_create_array_with_length(env, PCM_BANDS, &bandArr) == napi_ok) {
+                for (int k = 0; k < PCM_BANDS; ++k) {
+                    napi_value v;
+                    if (napi_create_double(env, frame->bandAmp[k], &v) == napi_ok) {
+                        napi_set_element(env, bandArr, k, v);
+                    }
+                }
+                napi_set_named_property(env, object, "bandAmp", bandArr);
+            }
+
+            napi_value undefined;
+            napi_get_undefined(env, &undefined);
+            napi_call_function(env, undefined, js_callback, 1, &object, nullptr);
+        }
+    }
+    delete frame;
+}
+
+static void PublishDs5PcmFrame(const Ds5PcmFrameData& frame) {
+    // v67: 这里原来有一段离线诊断落盘（每帧 fopen /data/local/tmp/ds5_pcm_diag.log
+    // + fprintf + fflush）。50Hz 帧流下等于在音频回调线程每秒做 50 次同步 I/O，
+    // 且本机 app 对该目录并无写权限，属定版清理漏项。已删除，勿再加回来。
+    napi_threadsafe_function tsfn = g_connCallbacks.tsfn_ds5HapticsPcm;
+    if (tsfn == nullptr) return;
+    Ds5PcmFrameData* payload = new (std::nothrow) Ds5PcmFrameData(frame);
+    if (payload == nullptr) return;
+    const napi_status status = napi_call_threadsafe_function(
+        tsfn, payload, napi_tsfn_nonblocking);
+    if (status != napi_ok) delete payload;
+}
+
+// v71: 官方编码器（libwin_codec.so）相关代码与开关**已全部删除**。
+// 原因有二，缺一不可：
+//   1) 合规：libwin_codec.so 是从商业 APK（PeaSyo Android 2.1.0）提取的
+//      Razer Interhaptics 私有实现，没有任何可再分发授权，随 HAP 分发即侵权；
+//   2) 体感：v52~v57 实测编码器 12B/3 频带位流的上限低于 0x0E 软件合成，
+//      且与增益/削波/AGC 全无关，故 0x0E 为唯一正式链路。
+// 曾经为了「技术档案」保留 live 直灌实现，但那样会让私有库的调用者有理由
+// 重新编译进来；直接删干净，才能保证二进制里再也出不来那段代码。
+// 若将来真要再验证编码器：私有库副本在工程外 reverse/denise-prebuilt/arm64-v8a/，
+// 需自行重建适配层，**不要**把 lib 放回打包路径。
+
+// v23: 55AA 直灌路径已删除，见上方 CallJs_* 声明处说明。
+// （FeedRazerRawPcm 已于 v71 删除：55AA 是错误的帧格式，实测全部静音。）
+
+static void CallJs_RazerRawHaptic(napi_env env, napi_value js_callback, void* context, void* data) {
+    (void)context;
+    std::vector<uint8_t>* frames = static_cast<std::vector<uint8_t>*>(data);
+    if (frames == nullptr) return;
+    if (env != nullptr && js_callback != nullptr) {
+        napi_value arrayBuffer;
+        void* buf = nullptr;
+        if (napi_create_arraybuffer(env, frames->size(), &buf, &arrayBuffer) == napi_ok && buf != nullptr) {
+            memcpy(buf, frames->data(), frames->size());
+            napi_value typedArray;
+            if (napi_create_typedarray(env, napi_uint8_array, frames->size(), arrayBuffer, 0, &typedArray) == napi_ok) {
+                napi_value undefined;
+                napi_get_undefined(env, &undefined);
+                napi_call_function(env, undefined, js_callback, 1, &typedArray, nullptr);
+            }
+        }
+    }
+    delete frames;
+}
+
+void BridgeClDs5HapticsPcm(const LI_DS5_HAPTICS_PCM_FRAME* frame) {
+    initBandCoeff();
+    if (frame == nullptr || frame->pcmData == nullptr || frame->frameCount == 0) {
+        return;
+    }
+    constexpr uint8_t STREAM_END = LI_DS5_HAPTICS_PCM_FLAG_STREAM_END;
+    constexpr uint8_t DISCONTINUITY = LI_DS5_HAPTICS_PCM_FLAG_DISCONTINUITY;
+
+    if ((frame->flags & (STREAM_END | DISCONTINUITY)) != 0) {
+        // Flush what we have, then publish an explicit silent frame so ArkTS
+        // can mute immediately instead of waiting for a hold timer.
+        Ds5PcmFrameData silent;
+        silent.controllerNumber = frame->controllerNumber;
+        silent.flags = frame->flags;
+        silent.silent = 1;
+        silent.presentationTimeUs = static_cast<double>(frame->presentationTimeUs);
+        PublishDs5PcmFrame(silent);
+        g_pcmAccum.reset();
+        g_pcmHasHistory = false;
+        return;
+    }
+
+    if (frame->sampleRate != 48000 || frame->channelCount != 2 ||
+            frame->bitsPerSample != 16) {
+        // v67: 不再静默丢弃。格式不符意味着整条 0x0E 触感链路没有输入，
+        // 但过去这里一条日志都不打，只能看到 packets= 不涨而无法判断原因。
+        ++g_pcmFormatReject;
+        if (g_pcmFormatReject == 1 || g_pcmFormatReject % 2000 == 0) {
+            OH_LOG_WARN(LOG_APP,
+                "DS5 haptics PCM 格式不符，已丢弃 %{public}u 包: "
+                "rate=%{public}d ch=%{public}d bits=%{public}d frameCount=%{public}d",
+                g_pcmFormatReject, static_cast<int>(frame->sampleRate),
+                static_cast<int>(frame->channelCount),
+                static_cast<int>(frame->bitsPerSample),
+                static_cast<int>(frame->frameCount));
+        }
+        return;
+    }
+    if (++g_pcmPacketCount == 1 || g_pcmPacketCount % 200 == 0) {
+        OH_LOG_INFO(LOG_APP,
+            "DS5 haptics PCM stream: packets=%{public}u frames=%{public}u "
+            "lastPacketFrames=%{public}u rate=%{public}u",
+            g_pcmPacketCount, g_pcmFrameCount, frame->frameCount, frame->sampleRate);
+        OH_LOG_INFO(LOG_APP,
+            "DS5 PCM envelope: rawPeak=%{public}.4f rawMean=%{public}.4f "
+            "bandLow=%{public}.4f bandHigh=%{public}.4f "
+            "outLow=%{public}.4f outHigh=%{public}.4f "
+            "jump=%{public}.2f/%{public}.2f base=%{public}.4f/%{public}.4f "
+            "boost=%{public}.2f/%{public}.2f floor=%{public}.2f hf=%{public}.2f "
+            "bandAmp=%{public}.2f/%{public}.2f/%{public}.2f/%{public}.2f",
+            g_pcmRawPeak, g_pcmRawN > 0 ? g_pcmRawSum / g_pcmRawN : 0.0,
+            g_pcmLastBandLow, g_pcmLastBandHigh,
+            g_pcmLastOutLow, g_pcmLastOutHigh,
+            g_pcmLastCrestLow, g_pcmLastCrestHigh,
+            g_pcmLowBaseline, g_pcmHighBaseline,
+            g_pcmLastBoostLow, g_pcmLastBoostHigh, g_pcmLastImpactFloor, g_pcmLastFloorHigh,
+            g_pcmLastBandAmp[0], g_pcmLastBandAmp[1],
+            g_pcmLastBandAmp[2], g_pcmLastBandAmp[3]);
+        g_pcmRawPeak = 0.0;
+        g_pcmRawSum = 0.0;
+        g_pcmRawN = 0;
+    }
+    const uint8_t* pcm = frame->pcmData;
+    const uint32_t frames = frame->frameCount;
+    if (frame->pcmDataLength < frames * 4U) {
+        return;
+    }
+
+    // v71: 原先这里有两段死支路，均已删除：
+    //   1) FeedRazerRawPcm(pcm, frames) —— v36 起注释停用，55AA 协议本身是错的；
+    //   2) if (kLiveEncoderEnabled) { …DeniseEncoder_FeedLivePcm… } —— 官方编码器
+    //      直灌，v57 起恒不执行，v71 连同实现一起删掉（合规原因见上方说明）。
+    // ⚠️ 下面这段 0x0E 的 PCM 分析链是**唯一正式链路**，任何改动都要极其谨慎。
+
+    PcmAccumulator& acc = g_pcmAccum;
+    if (acc.frames == 0) {
+        acc.presentationTimeUs = frame->presentationTimeUs;
+    }
+
+    for (uint32_t i = 0; i < frames; ++i) {
+        const size_t offset = static_cast<size_t>(i) * 4U;
+        for (int c = 0; c < 2; ++c) {
+            const uint8_t* p = pcm + offset + c * 2U;
+            int16_t raw = static_cast<int16_t>(
+                static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8));
+            const float x = static_cast<float>(raw) / 32768.0f;
+            acc.lowpass[c] += PCM_LOWPASS_ALPHA * (x - acc.lowpass[c]);
+            const float low = acc.lowpass[c];
+            const float high = x - low;
+            acc.sumSq[c] += static_cast<double>(x) * x;
+            acc.lowSq[c] += static_cast<double>(low) * low;
+            acc.highSq[c] += static_cast<double>(high) * high;
+            // v60: 跟踪带内瞬时峰值（峰均比的分子）
+            const float aLow = std::fabs(low);
+            const float aHigh = std::fabs(high);
+            if (aLow > acc.lowPeak[c]) acc.lowPeak[c] = aLow;
+            if (aHigh > acc.highPeak[c]) acc.highPeak[c] = aHigh;
+            if ((x >= 0.0f) != (acc.previous[c] >= 0.0f)) {
+                acc.crossings[c]++;
+            }
+            acc.previous[c] = x;
+            // v20: 对原始全频带采样更新 4 子带 Goertzel 滑动状态。
+            for (int k = 0; k < PCM_BANDS; ++k) {
+                const float s = x + g_bandCoeff[k] * static_cast<float>(acc.gPrev[c][k])
+                    - static_cast<float>(acc.gPrev2[c][k]);
+                acc.gPrev2[c][k] = acc.gPrev[c][k];
+                acc.gPrev[c][k] = s;
+            }
+        }
+        acc.frames++;
+    }
+
+    if (acc.frames < PCM_WINDOW_FRAMES) {
+        return;  // keep accumulating; host sends ~5 ms packets
+    }
+
+    Ds5PcmFrameData out;
+    out.controllerNumber = frame->controllerNumber;
+    out.flags = frame->flags;
+    out.frameCount = acc.frames;
+    out.presentationTimeUs = static_cast<double>(acc.presentationTimeUs);
+
+    double rms[2];
+    double attack = 0.0;
+    double texture = 0.0;
+    for (int c = 0; c < 2; ++c) {
+        rms[c] = std::sqrt(acc.sumSq[c] / acc.frames);
+        const double bandTotal = acc.lowSq[c] + acc.highSq[c];
+        const double lowRatio = bandTotal > 1e-12 ? acc.lowSq[c] / bandTotal : 0.0;
+        if (c == 0) out.leftLowRatio = lowRatio;
+        else out.rightLowRatio = lowRatio;
+        // A rising envelope is a real waveform transient, not a heuristic.
+        const double delta = rms[c] - g_pcmPrevRms[c];
+        attack = std::max(attack,
+            g_pcmHasHistory ? std::min(1.0, delta / 0.02) : 0.0);
+        // Zero crossings per second, normalised against a 3 kHz tactile band.
+        const double zcr = static_cast<double>(acc.crossings[c]) * 48000.0 / acc.frames;
+        texture = std::max(texture, std::min(1.0, zcr / 3000.0));
+        g_pcmPrevRms[c] = static_cast<float>(rms[c]);
+    }
+    // v18: DS5 双通道是左右执行器，内容近乎相同；直接 L->重马达 / R->轻马达
+    // 拿不到频谱分离（v17 实测两路输出几乎一致，颗粒感只能靠 tex 一个参数）。
+    // 改用实测频段能量做 lane：低频带包络 -> 重通道，高频带包络 -> 轻通道，
+    // 沙砾/金属等材质颗粒真正落在轻马达上。
+    const double lowBand = std::sqrt(
+        (acc.lowSq[0] + acc.lowSq[1]) / (2.0 * acc.frames));
+    const double highBand = std::sqrt(
+        (acc.highSq[0] + acc.highSq[1]) / (2.0 * acc.frames));
+    // v19: 噪声门 + 感知扩展 + 软膝上限，输出即整形后的包络。
+    // v61: 叠加「相对基线跃升」瞬态增强 —— 只有能量远超近期常态的冲击帧受益，
+    //      雨滴与基线同量级 ⇒ jump≈1~2 ⇒ 加成恒为 0，细腻度与 v59 完全一致。
+    pcmUpdateBaseline(g_pcmLowBaseline, lowBand);
+    pcmUpdateBaseline(g_pcmHighBaseline, highBand);
+    const double jumpLow = lowBand / g_pcmLowBaseline;
+    const double jumpHigh = highBand / g_pcmHighBaseline;
+    const double boostLow = (jumpLow > PCM_JUMP_DEADZONE && lowBand > static_cast<double>(PCM_DEADZONE_RAW))
+        ? std::max(0.0, std::min(1.0, (jumpLow - PCM_JUMP_KNEE) * PCM_JUMP_SCALE))
+        : 0.0;
+    const double boostHigh = (jumpHigh > PCM_JUMP_DEADZONE && highBand > static_cast<double>(PCM_DEADZONE_RAW))
+        ? std::max(0.0, std::min(1.0, (jumpHigh - PCM_JUMP_KNEE) * PCM_JUMP_SCALE))
+        : 0.0;
+    out.leftRms = std::min(1.0, pcmShape(lowBand) + boostLow * PCM_TRANSIENT_BOOST);
+    out.rightRms = std::min(1.0, pcmShape(highBand) + boostHigh * PCM_TRANSIENT_BOOST);
+    // v64: **[v63 的轻马达压制已撤销]**
+    // v63 用 `out.rightRms *= (1 - 0.55*impact)` 压低轻马达来减少掩蔽，实测失败：
+    //   ① 雨滴帧 jumpHigh 会偶尔到 3.29~3.34（只差一点点越门槛）⇒ 也拿到微小 boost
+    //      ⇒ impact>0.01 成立 ⇒ 轻马达被压 ⇒ 雨滴纹理被打断；
+    //   ② 更致命：ArkTS `renderPcmFrame` 的余震锁定 `pcmHoldHigh` 记的是**压制后**的值，
+    //      落地时 high 被压到 ~28，**之后 120ms 余震期也一直被压在低值**
+    //      ⇒ 每次落地后都会丢一段雨滴纹理 ⇒ 用户实测「雨滴有不震动的真空期」。
+    // ⇒ 结论：**不能在已认可的通路上做减法**。想加重只能加低频（下面 bandAmp 那条），
+    //   不能压高频。此路今后不要再走。
+    // 遥测：整形前的真实 RMS 分布 + 本帧频段 lane + 整形后输出（每秒随周期日志输出）。
+    {
+        const double rawOverall = (rms[0] + rms[1]) * 0.5;
+        if (rawOverall > g_pcmRawPeak) g_pcmRawPeak = rawOverall;
+        g_pcmRawSum += rawOverall;
+        ++g_pcmRawN;
+        g_pcmLastBandLow = lowBand;
+        g_pcmLastBandHigh = highBand;
+        g_pcmLastOutLow = out.leftRms;
+        g_pcmLastOutHigh = out.rightRms;
+        g_pcmLastCrestLow = jumpLow;
+        g_pcmLastCrestHigh = jumpHigh;
+        g_pcmLastBoostLow = boostLow;
+        g_pcmLastBoostHigh = boostHigh;
+    }
+    // v20: 4 子带 Goertzel 频谱权重（携带 DS5 真实频谱指纹到 4 谐波分量）。
+    for (int c = 0; c < 2; ++c) {
+        double maxPow = 1e-12;
+        for (int k = 0; k < PCM_BANDS; ++k) {
+            const double p = acc.gPrev[c][k] * acc.gPrev[c][k]
+                + acc.gPrev2[c][k] * acc.gPrev2[c][k]
+                - static_cast<double>(g_bandCoeff[k]) * acc.gPrev[c][k] * acc.gPrev2[c][k];
+            acc.gPow[c][k] = p;
+            if (p > maxPow) maxPow = p;
+        }
+        for (int k = 0; k < PCM_BANDS; ++k) {
+            double a = (maxPow > 1e-9)
+                ? std::sqrt(acc.gPow[c][k] / maxPow) : 0.0;
+            // v22: 频率响应预加重——马达高频段滚降，逆响应提升高频带幅度，
+            // 让"脆"段（雨滴/铃铛）即便在弱响应区也能被手感觉到。
+            a = std::min(1.0, a * static_cast<double>(PCM_BAND_PREEMP[k]));
+            out.bandAmp[k] = a;
+        }
+        // v21: 高频带(子带3)上升沿锐化——雨滴/铃铛敲击是高频瞬态，
+        // 相对上一帧的跳变额外加力，让"脆"从频谱权重上凸显出来。
+        const double onset = out.bandAmp[3] - g_pcmLastBandAmp[3];
+        if (onset > 0.0) {
+            out.bandAmp[3] = std::min(1.0, out.bandAmp[3] + onset * static_cast<double>(PCM_CRISP_GAIN));
+        }
+    }
+    for (int k = 0; k < PCM_BANDS; ++k) g_pcmLastBandAmp[k] = out.bandAmp[k];
+    // ===== v62: 冲击帧 4 子带抬底（决定「落地够不够重」的关键）=====
+    // v61 实测：落地帧 bandLow=0.13~0.35、outLow 已满 1.0000、boost 也满，
+    // 但用户仍「落地震动还是不够」。原因不在档位，在**能量只挂在一个频点**：
+    //   落地 bandAmp=1.00/0.24/0.16/0.06 ⇒ Σ≈1.46
+    //   雨滴 bandAmp=1.00/0.49/0.00/0.00 ⇒ Σ≈1.49
+    // bandAmp 是「按本窗口最强子带归一化」的**相对**指纹，Σ 恒定在 1.5 上下；
+    // 而设备把 4 个 (幅度,频点) 分量**同时合成**，实际输出能量 ∝ Σ。
+    // ⇒ 落地把 63 档全给了一个频点，另外三个几乎为 0，总驱动只有满配的 ~36%，
+    //   所以"档位满了、体感还是弱"。雨滴 Σ 与落地相同，故雨滴一直"没问题"。
+    // 修法：冲击帧（jump 判据给出的 boost 高）给 4 个子带一个**保底**，
+    // 让能量在频域铺开（真实重冲击本就是宽带的）。雨滴 boost=0 ⇒ 抬底为 0
+    // ⇒ 频谱指纹与细腻度完全不变（"只增不减"约束）。
+    // v63: 保底 0.55 → 0.90（用户实测"好了一点、还不够"，同向加大）。
+    // v64: 改为**分频抬底** —— 低频 k=0/1/2 抬 0.85（冲击变厚），
+    //      高频 k=3 只抬 0.30（保留脆/碎裂质感，不把高频糊成白噪音）。
+    {
+        const double impact = std::max(boostLow, boostHigh);
+        g_pcmLastImpactFloor = 0.0;
+        g_pcmLastFloorHigh = 0.0;
+        if (impact > 0.01) {
+            g_pcmLastImpactFloor = PCM_IMPACT_BAND_FLOOR * impact;
+            g_pcmLastFloorHigh = PCM_IMPACT_BAND_FLOOR_HIGH * impact;
+            for (int k = 0; k < PCM_BANDS; ++k) {
+                const double floorAmp = ((k == PCM_BANDS - 1)
+                    ? PCM_IMPACT_BAND_FLOOR_HIGH : PCM_IMPACT_BAND_FLOOR) * impact;
+                if (out.bandAmp[k] < floorAmp) out.bandAmp[k] = floorAmp;
+            }
+        }
+    }
+    out.attack = std::max(0.0, attack);
+    out.texture = texture;
+    g_pcmHasHistory = true;
+
+    const bool silent = out.leftRms < PCM_MIN_ENVELOPE && out.rightRms < PCM_MIN_ENVELOPE;
+    out.silent = silent ? 1 : 0;
+    PublishDs5PcmFrame(out);
+    ++g_pcmFrameCount;
+    acc.reset();
 }
 
 void BridgeClDs5HapticsIrV2(const LI_DS5_HAPTICS_IR_FRAME_V2* frame) {

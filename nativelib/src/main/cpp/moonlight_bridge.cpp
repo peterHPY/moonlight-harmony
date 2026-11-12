@@ -152,10 +152,15 @@ static CONNECTION_LISTENER_CALLBACKS g_connCallbacksStruct = {
     .setAdaptiveTriggers = BridgeClSetAdaptiveTriggers,
     .resolutionChanged = (void (*)(uint32_t, uint32_t))BridgeClResolutionChanged,
     .clipboardData = BridgeClClipboardData,
-    // HarmonyOS accepts the device-independent IR stream and renders it in the
-    // source-aware ArkTS mixer. It intentionally does not advertise the
-    // Windows-only PCM endpoint, so Sunshine selects simulated DualSense mode.
-    .ds5HapticsPcm = nullptr,
+    // Advertise the raw authored DualSense tactile waveform. Sunshine owns a
+    // virtual 48 kHz stereo haptics endpoint with native four-channel haptics;
+    // IR v2 is only a lossy five-scalar fallback for transports that cannot
+    // carry the PCM. Receiving the waveform itself lets the client follow the
+    // authored dynamics (sand / grass / metal in Astro Bot) instead of
+    // reconstructing them from statistics.
+    .ds5HapticsPcm = BridgeClDs5HapticsPcm,
+    // Retained as a fallback decoder: if a host still emits 0x550B frames we
+    // render them through the existing source-aware ArkTS mixer.
     .ds5HapticsIrV2 = BridgeClDs5HapticsIrV2,
 };
 

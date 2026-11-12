@@ -83,6 +83,10 @@ typedef struct {
     napi_threadsafe_function tsfn_connectionStarted;
     napi_threadsafe_function tsfn_connectionTerminated;
     napi_threadsafe_function tsfn_rumble;
+    /** 主机原始 DS5 触觉 PCM（48kHz/2ch/16bit）的波形分析结果 */
+    napi_threadsafe_function tsfn_ds5HapticsPcm;
+    /** v23: 原始波形直灌 —— 48k→4k 重采样后打包成 64B raw 帧，供 ArkTS 经 Interface 3 直发执行器 */
+    napi_threadsafe_function tsfn_razerRawHaptic;
     napi_threadsafe_function tsfn_ds5HapticsIrV2;
     napi_threadsafe_function tsfn_connectionStatusUpdate;
     napi_threadsafe_function tsfn_setHdrMode;
@@ -138,6 +142,8 @@ void BridgeClSetAdaptiveTriggers(unsigned short controllerNumber, unsigned char 
 void BridgeClResolutionChanged(unsigned int width, unsigned int height);
 void BridgeClClipboardData(const char* data, int length);
 void BridgeClDs5HapticsIrV2(const LI_DS5_HAPTICS_IR_FRAME_V2* frame);
+/** 接收主机下发的原生 DualSense 触觉波形（PCM），在 native 层聚合成 20ms 波形帧。 */
+void BridgeClDs5HapticsPcm(const LI_DS5_HAPTICS_PCM_FRAME* frame);
 void BridgeClLogMessage(const char* format, ...);
 
 #ifdef __cplusplus
