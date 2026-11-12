@@ -90,3 +90,6 @@ release-symbols/
 
 # Standalone SDK checkout used by CI/local native builds.
 /audio-haptics-sdk/
+
+# 本地构建工具脚本（不应进入版本库）
+_hvigor_tools/
