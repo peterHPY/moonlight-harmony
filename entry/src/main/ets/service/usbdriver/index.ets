@@ -23,6 +23,8 @@ export { Dualshock4Controller } from './Dualshock4Controller';
 export { DualSenseController } from './DualSenseController';
 export { SwitchProController } from './SwitchProController';
 export { NativeHidController } from './NativeHidController';
+export { RazerKishiHaptics } from './RazerKishiHaptics';
+export { RazerKishiRawHaptics } from './RazerKishiRawHaptics';
 export { 
   ButtonFlags, 
   ControllerType, 

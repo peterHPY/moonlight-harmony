@@ -39,9 +39,46 @@ export class Xbox360Controller extends AbstractXboxController {
   }
   
   /**
+   * Razer 的 VID 0x1532 同时用于老款 Xbox 360 授权手柄（Sabertooth）和
+   * 现代 Kishi 系列。后者在 HID 模式是复合 HID 设备，在 XInput 模式是
+   * 0xFF/93/1 厂商接口 + interrupt 端点；本类直接使用 bulkTransfer 与
+   * 原始 USBEndpoint，真机上会持续 I/O 错误、反复掉线重建。
+   *
+   * 两种模式统一交给 NativeHidController：HID 模式按报告描述符动态解析，
+   * XInput 模式按固定 20 字节 X360 报告解析，且使用已验证可用的端点对象。
+   * 老款纯 X360 协议设备没有 HID 接口，仍走原 Xbox360Controller 路径。
+   */
+  private static isRazerModernController(device: usbManager.USBDevice): boolean {
+    if (device.vendorId !== 0x1532) {
+      return false;
+    }
+    if (device.productId === 0x0037) {  // Kishi Ultra，实机枚举 1532:0037
+      return true;
+    }
+    if (!device.configs || device.configs.length === 0) {
+      return false;
+    }
+    const config = device.configs[0];
+    if (!config.interfaces) {
+      return false;
+    }
+    for (const iface of config.interfaces) {
+      if (iface.clazz === UsbClass.USB_CLASS_HID) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * 检查是否可以驱动该设备
    */
   static canClaimDevice(device: usbManager.USBDevice): boolean {
+    if (Xbox360Controller.isRazerModernController(device)) {
+      Logger.info('Xbox360Controller', `${TAG} 跳过 Razer 现代手柄 (VID=0x1532, PID=0x${device.productId.toString(16)})，交给 NativeHidController 双模驱动`);
+      return false;
+    }
+
     // 检查厂商 ID
     if (!Xbox360.SUPPORTED_VENDORS.includes(device.vendorId)) {
       return false;

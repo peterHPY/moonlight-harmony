@@ -126,6 +126,8 @@ export struct UsbControllerTestView {
   @State displayRT: number = 0;
   @State hasInput: boolean = false;
   @State logMessages: string[] = [];
+  /** v29: 协议试音状态轮询定时器 */
+  private scanPollTimer: number = -1;
   @State pollRate: number = 0;
   @State pollCount: number = 0;
 
@@ -150,6 +152,10 @@ export struct UsbControllerTestView {
     this.stopUiRefreshTimer();
     this.stopPollRateTimer();
     this.stopDriver();
+    if (this.scanPollTimer !== -1) {
+      clearInterval(this.scanPollTimer);
+      this.scanPollTimer = -1;
+    }
   }
   
   private startPollRateTimer(): void {

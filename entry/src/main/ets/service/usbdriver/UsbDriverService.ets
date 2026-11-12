@@ -26,6 +26,8 @@ import { Dualshock4Controller } from './Dualshock4Controller';
 import { DualSenseController } from './DualSenseController';
 import { SwitchProController } from './SwitchProController';
 import { NativeHidController } from './NativeHidController';
+import { RazerKishiHaptics } from './RazerKishiHaptics';
+import { RazerKishiRawHaptics } from './RazerKishiRawHaptics';
 import { SettingsService } from '../../service/SettingsService';
 import nativeLib from 'libmoonlight_nativelib.so';
 import { Logger } from '../../common/Logger';
@@ -419,10 +421,15 @@ export class UsbDriverService implements UsbDriverListener {
         }
       }
       
-      // 停止并移除断开的控制器
-      for (const controller of controllersToRemove) {
-        controller.stop();
+    // 停止并移除断开的控制器
+    for (const controller of controllersToRemove) {
+      if (controller.getVendorId() === 0x1532) {
+        // 雷蛇触感接口与控制器共用 pipe，pipe 关闭前先释放触感接口
+        RazerKishiHaptics.getInstance().detach();
+        RazerKishiRawHaptics.getInstance().detach();
       }
+      controller.stop();
+    }
     } catch (err) {
       Logger.error('UsbDriverService', `${TAG} 检查断开设备失败:`, err);
     }
@@ -471,6 +478,10 @@ export class UsbDriverService implements UsbDriverListener {
       }
     }
     this.pendingControllerStops = Promise.all(stopPromises).then((): void => {});
+    
+    // pipe 即将关闭，先释放雷蛇触感接口（raw-PCM 与 0x0E 两路）
+    RazerKishiHaptics.getInstance().detach();
+    RazerKishiRawHaptics.getInstance().detach();
     
     this.processedDevices.clear();
     Logger.info('UsbDriverService', `${TAG} USB 驱动服务已停止，已释放 ${stoppedCount} 个控制器的 USB 独占`);
@@ -698,7 +709,7 @@ export class UsbDriverService implements UsbDriverListener {
     }
     
     Logger.info('UsbDriverService', `${TAG} 检测到可驱动的设备: ${device.name} (VID=0x${device.vendorId.toString(16)}, PID=0x${device.productId.toString(16)})`);
-    
+
     // 检查权限
     let hasPermission = false;
     try {
@@ -835,6 +846,21 @@ export class UsbDriverService implements UsbDriverListener {
     this.pendingResetDeviceKeys.delete(deviceKey);
     
     Logger.info('UsbDriverService', `${TAG} 控制器已启动: ID=${controller.getControllerId()}, Key=${deviceKey}`);
+    
+    // 雷蛇骑仕（Kishi Ultra / V3 Pro 等）：在同一 pipe 上占用触感接口。
+    // 触感接口与手柄输入接口相互独立，可以共存；失败不影响控制器本身。
+    if (RazerKishiHaptics.isRazerHapticsDevice(device)) {
+      // v24: 0x0E 永远挂载作为保底。raw 路径是异步延迟挂载，tryAttach 返回
+      // true 只代表「已排队」，900ms 后握手仍可能失败；若因此跳过 0x0E，
+      // 就会出现两路都没挂上、彻底静音（v23 实测事故）。
+      const hapticsAttached = RazerKishiHaptics.getInstance().tryAttach(device, pipe);
+      Logger.info('UsbDriverService',
+        `${TAG} 雷蛇触感接口(0x0E 保底)挂载: ${hapticsAttached ? '已排队（延迟占用）' : '不可用'}`);
+      // raw-PCM 直灌作为增强：只有它确实在成功发出帧时，0x0E 才让路。
+      const rawAttached = RazerKishiRawHaptics.getInstance().tryAttach(device, pipe);
+      Logger.info('UsbDriverService',
+        `${TAG} 雷蛇 raw-PCM 触感: ${rawAttached ? '已排队（延迟占用）' : '不可用'}`);
+    }
   }
   
   /**
@@ -1032,7 +1058,17 @@ export class UsbDriverService implements UsbDriverListener {
     }
     
     Logger.info('UsbDriverService', `${TAG} 控制器已移除: ID=${controller.getControllerId()}, Key=${deviceKey}`);
-    
+
+    // v68: 控制器因 IO 错误/断开被移除时，触感接口必须同步释放。
+    // 触感接口与控制器共用同一条 pipe，而 NativeHidController.stop() 随后就会
+    // closePipe；若这里不 detach，RazerKishiHaptics 的 attached 仍为 true 并
+    // 指向已关闭的管道，只能靠发送失败攒够 10 次才脱身，期间彻底静默。
+    // （此前的 detach 只写在 checkDisconnectedDevices 那条路径上，漏了这里。）
+    if (controller.getVendorId() === 0x1532) {
+      RazerKishiHaptics.getInstance().detach();
+      RazerKishiRawHaptics.getInstance().detach();
+    }
+
     if (this.listener) {
       this.listener.deviceRemoved(controller);
     }
