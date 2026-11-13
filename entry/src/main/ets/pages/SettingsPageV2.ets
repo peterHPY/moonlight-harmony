@@ -49,6 +49,7 @@ import { METERED_BANDWIDTH_PROBE_MAX_BYTES } from '../service/network/BandwidthP
 import { GYRO_SENSITIVITY_MIN, GYRO_SENSITIVITY_MAX } from '../service/input/GyroAssistService';
 import { Logger } from '../common/Logger';
 import { StringUtil } from '../utils/StringUtil';
+import { RazerKishiChroma } from '../service/usbdriver/RazerKishiChroma';
 
 /**
  * 选择器选项接口
@@ -215,6 +216,12 @@ struct SettingsPageV2 {
   @State forceUsbDriverOnly: boolean = false;  // 强制纯 USB 驱动模式
   @State ddkHighSpeedPolling: boolean = false;  // USB 驱动高速轮询
   @State usbForwardingEnabled: boolean = false;  // USB/IP 反向隧道转发
+  @State razerDs5LedSync: boolean = false;      // 匹配 DS5 灯光（雷蛇 Chroma 跟随主机灯色）
+  @State razerLedStatus: string = '未启用';     // 灯效链路实时状态（收包数 / 接口 / 命令组 / 发送结果）
+  @State razerLedPreview: string = '#0000FF';  // 实际写进手柄的输出色（亮度归一化后），用于页面色块预览
+  private razerTestColors: number[] = [0xFF0000, 0x00FF00, 0x0000FF, 0xFFFFFF, 0x00FFFF, 0xFF00FF, 0xFFFF00, 0xFF8000];
+  private razerTestIdx: number = -1;
+  private razerLedStatusTimer: number = -1;
   
   // 输入 - 屏幕控制器
   @State enableOnscreenControls: boolean = false;
@@ -370,6 +377,29 @@ struct SettingsPageV2 {
     this.loadNativeResolution();
     this.loadSettings();
     this.loadDecoderCapabilities();
+    this.startRazerLedStatusPolling();
+  }
+
+  aboutToDisappear(): void {
+    if (this.razerLedStatusTimer !== -1) {
+      clearInterval(this.razerLedStatusTimer);
+      this.razerLedStatusTimer = -1;
+    }
+  }
+
+  /** 设置页可见期间刷新灯效状态；只有打开开关才显示，纯读取不触发任何 USB 操作 */
+  private startRazerLedStatusPolling(): void {
+    this.refreshRazerLedStatus();
+    if (this.razerLedStatusTimer !== -1) return;
+    this.razerLedStatusTimer = setInterval((): void => {
+      this.refreshRazerLedStatus();
+    }, 1000);
+  }
+
+  private refreshRazerLedStatus(): void {
+    const chroma = RazerKishiChroma.getInstance();
+    this.razerLedStatus = chroma.getStatusText();
+    this.razerLedPreview = chroma.getPreviewColor();
   }
 
   onPageShow(): void {
@@ -572,7 +602,11 @@ struct SettingsPageV2 {
       this.forceUsbDriverOnly = await this.loadBoolean(SettingsKeys.FORCE_USB_DRIVER_ONLY, false);
       this.ddkHighSpeedPolling = await this.loadBoolean(SettingsKeys.DDK_HIGH_SPEED_POLLING, false);
       this.usbForwardingEnabled = await this.loadBoolean(SettingsKeys.USB_FORWARDING_ENABLED, false);
-      
+      this.razerDs5LedSync = await this.loadBoolean(SettingsKeys.RAZER_DS5_LED_SYNC, false);
+      // 单例自己也会异步读一次；这里显式对齐，避免设置页已加载而驱动还没读到开关
+      RazerKishiChroma.getInstance().setEnabled(this.razerDs5LedSync);
+      this.refreshRazerLedStatus();
+
       // 输入 - 屏幕控制器
       this.enableOnscreenControls = await this.loadBoolean(SettingsKeys.ENABLE_ONSCREEN_CONTROLS, false);
       this.enableOnscreenKeyboard = await this.loadBoolean(SettingsKeys.ENABLE_ONSCREEN_KEYBOARD, false);
@@ -1704,9 +1738,74 @@ struct SettingsPageV2 {
                 action: () => {
                   this.showHomeButtonActionPicker();
                 }
+              },
+              {
+                title: '匹配 DS5 灯光',
+                subtitle: this.razerDs5LedSync
+                  ? this.razerLedStatus
+                  : '打开后立即接管雷蛇原有灯效并套用主机 DS5 灯色；主机会持续发全黑占位心跳，已按「无灯色数据」忽略，不会被刷灭',
+                type: 'toggle',
+                value: this.razerDs5LedSync,
+                action: () => {
+                  this.razerDs5LedSync = !this.razerDs5LedSync;
+                  this.saveSetting(SettingsKeys.RAZER_DS5_LED_SYNC, this.razerDs5LedSync);
+                  // 立即生效：不需要等下一次串流 / 下一次 0x5502 包
+                  const chroma = RazerKishiChroma.getInstance();
+                  chroma.setEnabled(this.razerDs5LedSync);
+                  this.refreshRazerLedStatus();
+                  ToastQueue.show({
+                    message: this.razerDs5LedSync
+                      ? (chroma.isAttached
+                          ? '已接管雷蛇灯光，正在套用主机灯色'
+                          : '开关已打开；请启用 USB 驱动并连接雷蛇手柄，连上后自动接管')
+                      : '已停止匹配 DS5 灯光',
+                    duration: 2800
+                  });
+                }
+              },
+              {
+                title: '灯效手动测试（点一次换色）',
+                subtitle: '用已锁定的 Chroma 命令 0x0F/0x03 直接发预设色，绕过主机心跳，立刻看到雷蛇灯变色；这是验证动态链路的最快方式',
+                type: 'action',
+                visible: this.razerDs5LedSync,
+                action: () => {
+                  this.razerTestIdx = (this.razerTestIdx + 1) % this.razerTestColors.length;
+                  const c = this.razerTestColors[this.razerTestIdx];
+                  RazerKishiChroma.getInstance().testColor((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+                  this.refreshRazerLedStatus();
+                  ToastQueue.show({
+                    message: `已发送测试色 #${c.toString(16).padStart(6, '0').toUpperCase()}`,
+                    duration: 1800
+                  });
+                }
               }
             ]
           })
+
+          // 「匹配 DS5 灯光」打开后，页面末尾显示实际写入手柄的颜色，和手柄灯同步变化
+          if (this.razerDs5LedSync) {
+            Row() {
+              Text('当前输出灯色')
+                .fontSize(14)
+                .fontColor(AppColors.TextPrimary)
+              Blank()
+              Row()
+                .width(44)
+                .height(22)
+                .borderRadius(6)
+                .backgroundColor(this.razerLedPreview)
+                .border({ width: 1, color: '#66FFFFFF' })
+              Text(this.razerLedPreview)
+                .fontSize(13)
+                .fontColor(AppColors.TextSecondary)
+                .margin({ left: 10 })
+            }
+            .width('100%')
+            .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+            .backgroundColor(AppColors.CardBackground)
+            .borderRadius(12)
+            .margin({ bottom: 12 })
+          }
           
           // USB 手柄驱动
           this.SettingsGroup({

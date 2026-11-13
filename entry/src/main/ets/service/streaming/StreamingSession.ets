@@ -28,6 +28,7 @@ import { display } from '@kit.ArkUI';
 import { GamepadManager } from '../input/GamepadManager';
 import { MoonlightButton } from '../input/GamepadTypes';
 import { UsbForwardingService } from '../usbdriver/UsbForwardingService';
+import { RazerKishiChroma } from '../usbdriver/RazerKishiChroma';
 import { MicrophoneStream } from '../microphone/MicrophoneStream';
 import { AudioHapticFrame } from '../AudioHapticFrame';
 import { AudioVibrationService } from '../AudioVibrationService';
@@ -1708,7 +1709,10 @@ export class StreamingSession implements Ds5TouchpadInputSink {
         GamepadManager.getInstance().handleSetMotionEventState(cn, motionType, rateHz);
       },
       setControllerLED: (cn: number, r: number, g: number, b: number): void => {
+        // 主机 0x5502 Set RGB LED：保留原日志用于协议体检，同时转发给雷蛇 Chroma。
+        // RazerKishiChroma 内部默认关闭；只有「匹配 DS5 灯光」开关打开时才写 USB。
         Logger.info('StreamingSession', `LED: controller=${cn}, rgb=(${r},${g},${b})`);
+        RazerKishiChroma.getInstance().onHostLed(cn, r, g, b);
       },
       resolutionChanged: (width: number, height: number): void => {
         Logger.info('StreamingSession', `分辨率变化: ${width}x${height}`);

@@ -27,6 +27,7 @@ import { DualSenseController } from './DualSenseController';
 import { SwitchProController } from './SwitchProController';
 import { NativeHidController } from './NativeHidController';
 import { RazerKishiHaptics } from './RazerKishiHaptics';
+import { RazerKishiChroma } from './RazerKishiChroma';
 import { RazerKishiRawHaptics } from './RazerKishiRawHaptics';
 import { SettingsService } from '../../service/SettingsService';
 import nativeLib from 'libmoonlight_nativelib.so';
@@ -427,6 +428,7 @@ export class UsbDriverService implements UsbDriverListener {
         // 雷蛇触感接口与控制器共用 pipe，pipe 关闭前先释放触感接口
         RazerKishiHaptics.getInstance().detach();
         RazerKishiRawHaptics.getInstance().detach();
+        RazerKishiChroma.getInstance().detach();
       }
       controller.stop();
     }
@@ -482,6 +484,7 @@ export class UsbDriverService implements UsbDriverListener {
     // pipe 即将关闭，先释放雷蛇触感接口（raw-PCM 与 0x0E 两路）
     RazerKishiHaptics.getInstance().detach();
     RazerKishiRawHaptics.getInstance().detach();
+    RazerKishiChroma.getInstance().detach();
     
     this.processedDevices.clear();
     Logger.info('UsbDriverService', `${TAG} USB 驱动服务已停止，已释放 ${stoppedCount} 个控制器的 USB 独占`);
@@ -861,6 +864,13 @@ export class UsbDriverService implements UsbDriverListener {
       Logger.info('UsbDriverService',
         `${TAG} 雷蛇 raw-PCM 触感: ${rawAttached ? '已排队（延迟占用）' : '不可用'}`);
     }
+
+    // 雷蛇 Chroma 灯效（DS5 LED 同步）：与触感接口独立，共用同一条 pipe。
+    // 内部默认关闭，只有用户打开「匹配 DS5 灯光」开关才会往设备发命令；
+    // 开关已打开时 attach 内部会立即套用主机最近一次下发的灯色。
+    const chromaAttached = RazerKishiChroma.getInstance().attach(device, pipe);
+    Logger.info('UsbDriverService',
+      `${TAG} 雷蛇 Chroma 灯效接口: ${chromaAttached ? '已就绪' : '不可用'}`);
   }
   
   /**
@@ -1067,6 +1077,7 @@ export class UsbDriverService implements UsbDriverListener {
     if (controller.getVendorId() === 0x1532) {
       RazerKishiHaptics.getInstance().detach();
       RazerKishiRawHaptics.getInstance().detach();
+      RazerKishiChroma.getInstance().detach();
     }
 
     if (this.listener) {

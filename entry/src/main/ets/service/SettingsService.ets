@@ -104,6 +104,8 @@ export class SettingsKeys {
   static readonly FORCE_USB_DRIVER_ONLY: string = 'settings_force_usb_driver_only';  // 强制纯 USB 驱动模式（禁用 GCK）
   static readonly DDK_HIGH_SPEED_POLLING: string = 'settings_ddk_high_speed_polling';  // USB 驱动高速轮询（DDK）
   static readonly USB_FORWARDING_ENABLED: string = 'settings_usb_forwarding_enabled';  // USB/IP 反向隧道转发（OTG 手柄直通主机）
+  static readonly RAZER_DS5_LED_SYNC: string = 'settings_razer_ds5_led_sync';  // 匹配 DS5 灯光：把主机 0x5502 灯色转发到雷蛇 Chroma
+  static readonly RAZER_DS5_LED_RGB: string = 'settings_razer_ds5_led_rgb';    // 最近一次主机下发的灯色（0x00RRGGBB），供开关打开时立即套用
 
   // 输入 - 屏幕控制器
   static readonly ENABLE_ONSCREEN_CONTROLS: string = 'settings_enable_onscreen_controls';
